@@ -25,44 +25,59 @@ DB_STATE = {
     "banned": []
 }
 
+DB_MESSAGE_ID = None
+
 def sync_from_channel():
-    """قراءة البيانات من الرسالة المثبتة في قناة التخزين عند الإقلاع"""
-    global DB_STATE
+    """استرجاع محرك قاعدة البيانات من القناة ومنع الكتابة فوقها"""
+    global DB_STATE, DB_MESSAGE_ID
     try:
         chat = bot.get_chat(DB_CHANNEL_ID)
-        if chat.pinned_message and chat.pinned_message.text:
-            text = chat.pinned_message.text
-            match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
-            if match:
-                data = json.loads(match.group(1))
-                DB_STATE["admins"] = list(set(data.get("admins", [PRIMARY_ADMIN_ID])))
-                DB_STATE["users"] = list(set(data.get("users", [])))
-                DB_STATE["banned"] = list(set(data.get("banned", [])))
-                print("✅ تم استرجاع قاعدة البيانات بنجاح من القناة.")
-                return
-    except Exception as e:
-        print(f"⚠️ تعذر قراءة قاعدة البيانات: {e}")
-
-    save_to_channel()
-
-def save_to_channel():
-    """حفظ البيانات وتحديثها في القناة مباشرة"""
-    payload = json.dumps(DB_STATE, indent=2)
-    formatted_text = f"📦 **نسخة قاعدة البيانات المحدثة**\n\n```json\n{payload}\n```"
-    try:
-        chat = bot.get_chat(DB_CHANNEL_ID)
+        
+        # 1. فحص إذا كان هناك رسالة مثبتة موجودة أصلاً
         if chat.pinned_message:
+            DB_MESSAGE_ID = chat.pinned_message.message_id
+            text = chat.pinned_message.text or chat.pinned_message.caption
+            if text:
+                match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+                if match:
+                    data = json.loads(match.group(1))
+                    DB_STATE["admins"] = list(set(data.get("admins", [PRIMARY_ADMIN_ID]) + [PRIMARY_ADMIN_ID]))
+                    DB_STATE["users"] = list(set(data.get("users", [])))
+                    DB_STATE["banned"] = list(set(data.get("banned", [])))
+                    print(f"✅ تم استرجاع البيانات بنجاح: {len(DB_STATE['admins'])} أدمن، {len(DB_STATE['users'])} طالب.")
+                    return
+
+        print("⚠️ لم يتم العثور على رسالة مثبتة سابقة، جاري إنشاء قاعدة بيانات أولية...")
+        save_to_channel(create_new=True)
+
+    except Exception as e:
+        print(f"❌ خطأ أثناء قراءة القناة: {e}")
+
+def save_to_channel(create_new=False):
+    """تحديث الرسالة المثبتة في القناة بدون مسح البيانات"""
+    global DB_MESSAGE_ID
+    # التأكد دائماً أن المدير الأساسي موجود ولا يُحذف أبداً
+    if PRIMARY_ADMIN_ID not in DB_STATE["admins"]:
+        DB_STATE["admins"].append(PRIMARY_ADMIN_ID)
+
+    payload = json.dumps(DB_STATE, indent=2, ensure_ascii=False)
+    formatted_text = f"📦 **قاعدة بيانات البوت المزامنة**\n\n```json\n{payload}\n```"
+
+    try:
+        if DB_MESSAGE_ID and not create_new:
             bot.edit_message_text(
                 formatted_text,
                 chat_id=DB_CHANNEL_ID,
-                message_id=chat.pinned_message.message_id,
+                message_id=DB_MESSAGE_ID,
                 parse_mode="Markdown"
             )
         else:
             msg = bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
+            DB_MESSAGE_ID = msg.message_id
             bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
+            print(f"📌 تم تثبيت رسالة قاعدة البيانات الجديدة برقم: {DB_MESSAGE_ID}")
     except Exception as e:
-        print(f"❌ خطأ أثناء المزامنة مع القناة: {e}")
+        print(f"❌ خطأ أثناء الحفظ في القناة: {e}")
 
 broadcasting_admins = {}
 adding_admin_state = {}
@@ -292,14 +307,12 @@ def reply_to_user(message):
 # دالة التشغيل المتوافقة مع Thread و Event Loop
 # ==========================================
 def run():
-    # إنشاء loop غير متزامنة مخصصة للـ Thread لتفادي تعليق telebot
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    # مزامنة البيانات مع القناة السحابية
     sync_from_channel()
     
-    print("Bot 2 (Saqimmah) is running with Event Loop & Channel DB...")
+    print("Bot 1 (Saqimmah) is running with Event Loop & Channel DB...")
     while True:
         try:
             bot.infinity_polling(timeout=20, long_polling_timeout=20)
