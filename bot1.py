@@ -11,7 +11,7 @@ import time
 BOT_TOKEN = "8938474760:AAHBLfDoV_d1D8EKhYmSRocCpVTimbDpUgk"
 PRIMARY_ADMIN_ID = 8145086924  
 
-# قناة التخزين السحابية المحدثة
+# قناة التخزين السحابية
 DB_CHANNEL_ID = -1004485802515  
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -38,25 +38,33 @@ def sync_from_channel():
             DB_MESSAGE_ID = chat.pinned_message.message_id
             text = chat.pinned_message.text or chat.pinned_message.caption
             if text:
-                match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+                # 🛑 التعديل الجذري: نبحث عن أقواس الـ JSON مباشرة متجاهلين التنسيق
+                match = re.search(r'(\{.*\})', text, re.DOTALL)
                 if match:
-                    data = json.loads(match.group(1))
-                    DB_STATE["admins"] = list(set(data.get("admins", [PRIMARY_ADMIN_ID]) + [PRIMARY_ADMIN_ID]))
-                    DB_STATE["users"] = list(set(data.get("users", [])))
-                    DB_STATE["banned"] = list(set(data.get("banned", [])))
-                    print(f"✅ تم استرجاع البيانات بنجاح: {len(DB_STATE['admins'])} أدمن، {len(DB_STATE['users'])} طالب.")
-                    return
+                    try:
+                        data = json.loads(match.group(1))
+                        # استرجاع البيانات ودمجها مع المدير الأساسي لضمان عدم حذفه
+                        DB_STATE["admins"] = list(set(data.get("admins", []) + [PRIMARY_ADMIN_ID]))
+                        DB_STATE["users"] = list(set(data.get("users", [])))
+                        DB_STATE["banned"] = list(set(data.get("banned", [])))
+                        print(f"✅ تم استرجاع البيانات بنجاح: {len(DB_STATE['admins'])} أدمن، {len(DB_STATE['users'])} طالب.")
+                        return
+                    except Exception as e:
+                        print(f"❌ فشل فك تشفير البيانات من القناة: {e}")
 
-        print("⚠️ لم يتم العثور على رسالة مثبتة سابقة، جاري إنشاء قاعدة بيانات أولية...")
-        save_to_channel(create_new=True)
+        # إذا لم تكن هناك رسالة، أو كانت البيانات تالفة، سيقوم بالتعديل على نفس الرسالة (إن وجدت) أو إنشاء واحدة
+        print("⚠️ لم يتم العثور على بيانات صالحة، جاري التحديث أو إنشاء رسالة جديدة...")
+        save_to_channel()
 
     except Exception as e:
-        print(f"❌ خطأ أثناء قراءة القناة: {e}")
+        print(f"❌ خطأ أثناء قراءة القناة (تأكد من رفع البوت كمشرف): {e}")
+        # إذا فشل الوصول للقناة تماماً، نحاول إرسال رسالة جديدة وتثبيتها
+        save_to_channel(create_new=True)
 
 def save_to_channel(create_new=False):
     """تحديث الرسالة المثبتة في القناة بدون مسح البيانات"""
     global DB_MESSAGE_ID
-    # التأكد دائماً أن المدير الأساسي موجود ولا يُحذف أبداً
+    # التأكد دائماً أن المدير الأساسي موجود
     if PRIMARY_ADMIN_ID not in DB_STATE["admins"]:
         DB_STATE["admins"].append(PRIMARY_ADMIN_ID)
 
@@ -64,13 +72,21 @@ def save_to_channel(create_new=False):
     formatted_text = f"📦 **قاعدة بيانات البوت المزامنة**\n\n```json\n{payload}\n```"
 
     try:
+        # التعديل على نفس الرسالة المثبتة دائماً لتفادي التكرار
         if DB_MESSAGE_ID and not create_new:
-            bot.edit_message_text(
-                formatted_text,
-                chat_id=DB_CHANNEL_ID,
-                message_id=DB_MESSAGE_ID,
-                parse_mode="Markdown"
-            )
+            try:
+                bot.edit_message_text(
+                    formatted_text,
+                    chat_id=DB_CHANNEL_ID,
+                    message_id=DB_MESSAGE_ID,
+                    parse_mode="Markdown"
+                )
+            except Exception as edit_err:
+                # إذا تم حذف الرسالة المثبتة يدوياً، ننشئ واحدة جديدة
+                if "message to edit not found" in str(edit_err).lower():
+                    msg = bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
+                    DB_MESSAGE_ID = msg.message_id
+                    bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
         else:
             msg = bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
             DB_MESSAGE_ID = msg.message_id
