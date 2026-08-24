@@ -1,9 +1,17 @@
 import os
 import threading
 import time
+import asyncio
 from flask import Flask
 
-# استيراد ملفات البوتات
+# التعديل الأهم: تهيئة Event Loop في الخيط الرئيسي قبل استيراد أي بوت
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# استيراد ملفات البوتات بعد التهيئة
 try:
     import bot1
 except ImportError:
@@ -21,6 +29,10 @@ def home():
     return "Bots are running successfully!"
 
 def run_bot1():
+    # نعطي كل Thread اللوب الخاص فيه
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     if bot1 and hasattr(bot1, 'run'):
         print("[INFO] Starting Bot 1 (Saqimmah)...")
         while True:
@@ -31,6 +43,9 @@ def run_bot1():
                 time.sleep(10)
 
 def run_bot2():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     if bot2 and hasattr(bot2, 'run'):
         print("[INFO] Starting Bot 2 (Userbot Manager)...")
         while True:
@@ -41,7 +56,6 @@ def run_bot2():
                 time.sleep(10)
 
 if __name__ == '__main__':
-    # تأكد من أننا نشغل البوتات مرة واحدة فقط لتفادي خطأ 409
     if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         print("[INFO] Initializing bots threads...")
         
@@ -53,7 +67,5 @@ if __name__ == '__main__':
             t2 = threading.Thread(target=run_bot2, daemon=True)
             t2.start()
 
-    # تشغيل خادم الويب
     port = int(os.environ.get('PORT', 10000))
-    # نستخدم use_reloader=False لمنع Flask من تشغيل الكود مرتين
     app.run(host='0.0.0.0', port=port, use_reloader=False)
