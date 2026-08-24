@@ -2,8 +2,6 @@ import telebot
 import re
 import os
 import json
-from flask import Flask
-from threading import Thread
 
 # ==========================================
 # الإعدادات الأساسية
@@ -14,7 +12,7 @@ PRIMARY_ADMIN_ID = 8145086924
 # ملفات الحفظ
 ADMINS_FILE = "admins.json"
 USERS_FILE = "users.json"
-BANNED_FILE = "banned.json" # ملف لحفظ المحظورين
+BANNED_FILE = "banned.json"
 
 def load_data(filename, default_data):
     if os.path.exists(filename):
@@ -33,7 +31,7 @@ ADMINS = load_data(ADMINS_FILE, {PRIMARY_ADMIN_ID})
 USERS = load_data(USERS_FILE, set())
 BANNED = load_data(BANNED_FILE, set())
 
-# تتبع حالات الإدمنية (هل هو يذيع أو يضيف أدمن)
+# تتبع حالات الإدمنية
 broadcasting_admins = {}
 adding_admin_state = {}
 
@@ -55,12 +53,10 @@ WELCOME_MESSAGE = """أهلًا بك {name} في بوت قمة للقدرات ل
 def ban_user(message):
     if message.chat.id in ADMINS:
         user_id = None
-        # إذا كان الأدمن يرد على رسالة الطالب
         if message.reply_to_message and message.reply_to_message.text:
             match = re.search(r'الآي دي:\s*(\d+)', message.reply_to_message.text)
             if match:
                 user_id = int(match.group(1))
-        # إذا كتب الآي دي يدوياً بعد الأمر
         elif len(message.text.split()) > 1:
             try:
                 user_id = int(message.text.split()[1])
@@ -128,7 +124,6 @@ def send_welcome(message):
         
         markup.add(broadcast_btn)
         
-        # إظهار زر إضافة أدمن للمدير الأساسي فقط
         if user_id == PRIMARY_ADMIN_ID:
             add_admin_btn = telebot.types.InlineKeyboardButton("➕ إضافة أدمن", callback_data="add_admin_mode")
             markup.row(stats_btn, add_admin_btn)
@@ -137,10 +132,9 @@ def send_welcome(message):
             
         bot.reply_to(message, "أهلاً بك في لوحة الإدارة 👮‍♂️.\n\n👇 للتحكم السريع استخدم الأزرار:", reply_markup=markup)
     else:
-        if user_id in BANNED: return # لا نرد على المحظورين
+        if user_id in BANNED: return
         bot.reply_to(message, WELCOME_MESSAGE.format(name=message.from_user.first_name))
 
-# التعامل مع الأزرار الشفافة
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     if call.data == "broadcast_mode" and call.message.chat.id in ADMINS:
@@ -160,7 +154,6 @@ def callback_query(call):
             chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown"
         )
 
-# استقبال حالة إضافة أدمن عبر الزر
 @bot.message_handler(func=lambda message: message.chat.id == PRIMARY_ADMIN_ID and adding_admin_state.get(message.chat.id, False))
 def handle_add_admin_state(message):
     if message.text == 'الغاء':
@@ -177,7 +170,6 @@ def handle_add_admin_state(message):
     except ValueError:
         bot.reply_to(message, "❌ الرجاء إرسال أرقام فقط (الآي دي)، أو أرسل 'الغاء'.")
 
-# استقبال رسالة الإذاعة من الأدمن
 @bot.message_handler(func=lambda message: message.chat.id in ADMINS and broadcasting_admins.get(message.chat.id, False), content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker'])
 def handle_broadcast_message(message):
     if message.content_type == 'text' and message.text == 'الغاء':
@@ -205,7 +197,6 @@ def handle_broadcast_message(message):
 def handle_user_message(message):
     user_id = message.from_user.id
     
-    # تجاهل المحظورين تماماً
     if user_id in BANNED:
         return
         
@@ -233,7 +224,6 @@ def handle_user_message(message):
 
 @bot.message_handler(func=lambda message: message.chat.id in ADMINS and message.reply_to_message)
 def reply_to_user(message):
-    # تجاهل الردود إذا كان الأدمن يستخدم أوامر
     if message.text and message.text.startswith('/'):
         return
         
@@ -267,23 +257,8 @@ def reply_to_user(message):
         bot.reply_to(message, "❌ تأكد أنك ترد (Reply) على رسالة تحتوي على الآي دي.")
 
 # ==========================================
-# إعداد الخادم (Port Bind) ليتوافق مع Render
+# دالة التشغيل المتوافقة مع المشغل الرئيسي bot.py
 # ==========================================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is alive and running!"
-
 def run():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-if __name__ == "__main__":
-    keep_alive()
-    print("Bot is running...")
+    print("Bot 2 (Saqimmah) is running...")
     bot.infinity_polling()
