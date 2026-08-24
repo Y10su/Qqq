@@ -1,163 +1,153 @@
 import os
 import asyncio
 import json
-import urllib.request
+import re
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid
 
 # ==========================================
-# 1. إعدادات البوت والآي دي والتطبيق المباشرة
+# 1. إعدادات اليوزر بوت
 # ==========================================
-BOT_TOKEN = "7662959141:AAG6n0yqVm-lvD8eq1PS1NNWAsvSlmcYbos"
+BOT_TOKEN = "8666142908:AAFZhEu_McY2TEy_6wtGbB7RhjFbxF7fTeE"
 API_ID = 37129514
 API_HASH = "29af008f32ddd784867118d0a58fb8c6"
-ADMIN_ID = 8145086924
+PRIMARY_ADMIN_ID = 8145086924
 
-# رابط قاعدة البيانات السحابية (اختياري، يعمل محلياً وسحابياً)
-DB_ENDPOINT = os.environ.get("DB_ENDPOINT", "")
-DB_API_KEY = os.environ.get("DB_API_KEY", "")
+# قناة التخزين السحابي الجديدة لليوزر بوت
+DB_CHANNEL_ID = -1004352728061
 
 bot = AsyncTeleBot(BOT_TOKEN)
-
 login_sessions = {}
-active_clients = {}
 
 # ==========================================
-# 2. إدارة التخزين السحابي / المحلي للجلسات
+# 2. نظام إدارة قاعدة البيانات عبر قناة التليجرام
 # ==========================================
-def save_account_cloud(phone_number, session_string):
-    """حفظ الجلسة لضمان عدم فقدان الحسابات نهائياً"""
-    if not DB_ENDPOINT:
-        local_db = {}
-        if os.path.exists("saved_sessions.json"):
-            try:
-                with open("saved_sessions.json", "r") as f: local_db = json.load(f)
-            except: pass
-        local_db[phone_number] = session_string
-        with open("saved_sessions.json", "w") as f: json.dump(local_db, f)
-        return
+DB_STATE = {
+    "admins": [PRIMARY_ADMIN_ID],
+    "accounts": {}  # سيتم حفظ الحسابات هنا: { "رقم الجوال": "كود الجلسة" }
+}
 
+DB_MESSAGE_ID = None
+
+async def sync_from_channel():
+    """استرجاع قاعدة البيانات السحابية لليوزر بوت (نفس طريقة البوت الأول)"""
+    global DB_STATE, DB_MESSAGE_ID
     try:
-        data = json.dumps({phone_number: session_string}).encode("utf-8")
-        req = urllib.request.Request(DB_ENDPOINT, data=data, headers={
-            "Content-Type": "application/json",
-            "X-Master-Key": DB_API_KEY
-        }, method="PUT")
-        urllib.request.urlopen(req)
+        chat = await bot.get_chat(DB_CHANNEL_ID)
+        
+        if chat.pinned_message:
+            DB_MESSAGE_ID = chat.pinned_message.message_id
+            text = chat.pinned_message.text or chat.pinned_message.caption
+            if text:
+                match = re.search(r'(\{.*\})', text, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        DB_STATE["admins"] = list(set(data.get("admins", []) + [PRIMARY_ADMIN_ID]))
+                        DB_STATE["accounts"] = data.get("accounts", {})
+                        print(f"✅ تم استرجاع البيانات بنجاح: {len(DB_STATE['accounts'])} حساب محفوظ.")
+                        return
+                    except Exception as e:
+                        print(f"❌ فشل فك تشفير البيانات من القناة: {e}")
+
+        print("⚠️ لم يتم العثور على قاعدة بيانات صالحة، جاري الإنشاء...")
+        await save_to_channel()
+
     except Exception as e:
-        print(f"Cloud DB Save Error: {e}")
+        print(f"❌ خطأ أثناء قراءة القناة (تأكد من رفع البوت كمشرف): {e}")
+        await save_to_channel(create_new=True)
 
-def get_all_saved_accounts():
-    """استرجاع كل الحسابات المحفوظة"""
-    if not DB_ENDPOINT:
-        if os.path.exists("saved_sessions.json"):
-            try:
-                with open("saved_sessions.json", "r") as f: return json.load(f)
-            except: pass
-        return {}
+async def save_to_channel(create_new=False):
+    """تحديث الرسالة المثبتة في القناة بدون مسح البيانات"""
+    global DB_MESSAGE_ID
+    if PRIMARY_ADMIN_ID not in DB_STATE["admins"]:
+        DB_STATE["admins"].append(PRIMARY_ADMIN_ID)
+
+    payload = json.dumps(DB_STATE, indent=2, ensure_ascii=False)
+    formatted_text = f"📦 **قاعدة بيانات اليوزر بوت (الحسابات والجلسات)**\n\n```json\n{payload}\n```"
+
     try:
-        req = urllib.request.Request(DB_ENDPOINT, headers={"X-Master-Key": DB_API_KEY})
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode())
-    except:
-        return {}
+        if DB_MESSAGE_ID and not create_new:
+            try:
+                await bot.edit_message_text(
+                    formatted_text,
+                    chat_id=DB_CHANNEL_ID,
+                    message_id=DB_MESSAGE_ID,
+                    parse_mode="Markdown"
+                )
+            except Exception as edit_err:
+                if "message to edit not found" in str(edit_err).lower():
+                    msg = await bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
+                    DB_MESSAGE_ID = msg.message_id
+                    await bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
+        else:
+            msg = await bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
+            DB_MESSAGE_ID = msg.message_id
+            await bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
+            print(f"📌 تم تثبيت رسالة قاعدة البيانات الجديدة برقم: {DB_MESSAGE_ID}")
+    except Exception as e:
+        print(f"❌ خطأ أثناء الحفظ في القناة: {e}")
 
 # ==========================================
-# 3. واجهة التحكم والأوامر
+# 3. واجهة التحكم باليوزر بوت
 # ==========================================
 @bot.message_handler(commands=['start'])
 async def start_cmd(message):
-    if message.chat.id != ADMIN_ID:
-        await bot.reply_to(message, "⛔ هذا البوت مخصص للإدارة والتحكم بالحسابات فقط.")
+    if message.chat.id not in DB_STATE["admins"]:
+        await bot.reply_to(message, "⛔ هذا البوت مخصص للإدارة فقط.")
         return
 
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("➕ تسجيل دخول حساب جديد", callback_data="add_account"))
-    markup.add(InlineKeyboardButton("📱 الحسابات المتصلة", callback_data="list_accounts"))
-    markup.add(InlineKeyboardButton("⚡ ميزة أولية: فحص نشاط الحسابات", callback_data="check_status"))
-
+    markup.add(InlineKeyboardButton("➕ إضافة حساب جديد (تسجيل دخول)", callback_data="add_account"))
+    
+    accounts_count = len(DB_STATE["accounts"])
     await bot.send_message(
         message.chat.id,
-        "👋 **مرحباً بك في نظام إدارة حسابات تليجرام**\n\nاختر من الخيارات بالأسفل للبدء:",
+        f"👋 **لوحة تحكم اليوزر بوت (Userbot Manager)**\n\n"
+        f"☁️ *الحسابات المحفوظة حالياً:* **{accounts_count}**\n"
+        f"يتم حفظ الجلسات في القناة السحابية باستخدام نفس نظام البوت الأول.",
         reply_markup=markup,
         parse_mode="Markdown"
     )
 
-@bot.callback_query_handler(func=lambda call: call.message.chat.id == ADMIN_ID)
+@bot.callback_query_handler(func=lambda call: call.message.chat.id in DB_STATE["admins"])
 async def callbacks(call):
     if call.data == "add_account":
-        login_sessions[ADMIN_ID] = {"step": "phone"}
-        await bot.send_message(ADMIN_ID, "📱 أرسل رقم هاتف الحساب مع المفتاح الدولي (مثال: `+966500000000`):", parse_mode="Markdown")
-        await bot.answer_callback_query(call.id)
-
-    elif call.data == "list_accounts":
-        accounts = get_all_saved_accounts()
-        if not accounts:
-            await bot.send_message(ADMIN_ID, "📭 لا يوجد أي حسابات مسجلة حتى الآن.")
-        else:
-            text = "📋 **الحسابات المسجلة والدائمة:**\n\n"
-            for phone in accounts.keys():
-                text += f"• `{phone}`\n"
-            await bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
-        await bot.answer_callback_query(call.id)
-
-    elif call.data == "check_status":
-        accounts = get_all_saved_accounts()
-        if not accounts:
-            await bot.send_message(ADMIN_ID, "❌ لا توجد حسابات لإجراء الفحص.")
-            await bot.answer_callback_query(call.id)
-            return
-
-        await bot.send_message(ADMIN_ID, "⏳ جاري فحص حالة الحسابات ومزامنة معلوماتها...")
-        for phone, session_str in accounts.items():
-            try:
-                client = Client(f"session_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_str, in_memory=True)
-                await client.start()
-                me = await client.get_me()
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🟢 **حساب نشط:**\n"
-                    f"👤 الاسم: {me.first_name}\n"
-                    f"🆔 الآي دي: `{me.id}`\n"
-                    f"📞 الرقم: `{phone}`\n"
-                    f"💬 اليوزر: @{me.username or 'بدون'}",
-                    parse_mode="Markdown"
-                )
-                await client.stop()
-            except Exception as e:
-                await bot.send_message(ADMIN_ID, f"🔴 **فشل الاتصال بالحساب `{phone}`:**\n{e}", parse_mode="Markdown")
+        login_sessions[call.message.chat.id] = {"step": "phone"}
+        await bot.send_message(call.message.chat.id, "📱 أرسل رقم هاتف الحساب مع المفتاح الدولي (مثال: `+966500000000`):", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
 
 # ==========================================
-# 4. استقبال خطوات تسجيل الدخول
+# 4. تسجيل الدخول والتعامل مع الأكواد و 2FA
 # ==========================================
-@bot.message_handler(func=lambda msg: msg.chat.id == ADMIN_ID and ADMIN_ID in login_sessions)
+@bot.message_handler(func=lambda msg: msg.chat.id in DB_STATE["admins"] and msg.chat.id in login_sessions)
 async def handle_login_flow(message):
-    session_data = login_sessions[ADMIN_ID]
+    admin_id = message.chat.id
+    session_data = login_sessions[admin_id]
     step = session_data.get("step")
 
-    # الخطوة 1: الرقم وإرسال الكود
+    # الخطوة 1: طلب الكود
     if step == "phone":
         phone = message.text.strip().replace(" ", "")
         client = Client(f"temp_{phone}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
         await client.connect()
         try:
             sent_code = await client.send_code(phone)
-            login_sessions[ADMIN_ID] = {
+            login_sessions[admin_id] = {
                 "step": "code",
                 "phone": phone,
                 "client": client,
                 "phone_code_hash": sent_code.phone_code_hash
             }
-            await bot.reply_to(message, "📩 تم إرسال الكود إلى تطبيق تليجرام.\n\nأرسل الكود مفصولاً بمسافات (مثل: `1 2 3 4 5`):", parse_mode="Markdown")
+            await bot.reply_to(message, "📩 تم إرسال الكود إلى تطبيق تليجرام الخاص بالحساب.\n\nأرسل الكود هنا (يُفضل إرساله مفصولاً بمسافات لتفادي الحظر مثل: `1 2 3 4 5`):", parse_mode="Markdown")
         except Exception as e:
             await client.disconnect()
-            login_sessions.pop(ADMIN_ID, None)
+            login_sessions.pop(admin_id, None)
             await bot.reply_to(message, f"❌ خطأ أثناء إرسال الكود: {e}")
 
-    # الخطوة 2: فحص الكود
+    # الخطوة 2: التحقق من الكود
     elif step == "code":
         code = message.text.strip().replace(" ", "")
         client = session_data["client"]
@@ -167,15 +157,19 @@ async def handle_login_flow(message):
         try:
             await client.sign_in(phone, phone_code_hash, code)
             session_string = await client.export_session_string()
-            save_account_cloud(phone, session_string)
+            
+            # حفظ الحساب في القاعدة السحابية
+            DB_STATE["accounts"][phone] = session_string
+            await save_to_channel()
+            
             await client.disconnect()
-            login_sessions.pop(ADMIN_ID, None)
-            await bot.reply_to(message, f"✅ **تم تسجيل الدخول بنجاح وحفظ الحساب `{phone}`!**", parse_mode="Markdown")
+            login_sessions.pop(admin_id, None)
+            await bot.reply_to(message, f"✅ **تم تسجيل الدخول بنجاح!**\nتم حفظ جلسة الحساب `{phone}` في قاعدتك السحابية.", parse_mode="Markdown")
         except SessionPasswordNeeded:
-            login_sessions[ADMIN_ID]["step"] = "2fa"
+            login_sessions[admin_id]["step"] = "2fa"
             await bot.reply_to(message, "🔐 الحساب محمي بالتحقق بخطوتين (2FA).\nالرجاء إرسال كلمة المرور الآن:")
         except (PhoneCodeInvalid, Exception) as e:
-            await bot.reply_to(message, f"❌ كود غير صحيح أو خطأ: {e}")
+            await bot.reply_to(message, f"❌ الكود غير صحيح أو حدث خطأ: {e}")
 
     # الخطوة 3: التحقق بخطوتين
     elif step == "2fa":
@@ -186,19 +180,26 @@ async def handle_login_flow(message):
         try:
             await client.check_password(password)
             session_string = await client.export_session_string()
-            save_account_cloud(phone, session_string)
+            
+            # حفظ الحساب في القاعدة السحابية
+            DB_STATE["accounts"][phone] = session_string
+            await save_to_channel()
+            
             await client.disconnect()
-            login_sessions.pop(ADMIN_ID, None)
-            await bot.reply_to(message, f"✅ **تم التحقق وحفظ الحساب `{phone}` دائماً!**", parse_mode="Markdown")
+            login_sessions.pop(admin_id, None)
+            await bot.reply_to(message, f"✅ **تم التحقق وكلمة المرور صحيحة!**\nتم حفظ جلسة الحساب `{phone}` في قاعدتك السحابية.", parse_mode="Markdown")
         except (PasswordHashInvalid, Exception) as e:
             await bot.reply_to(message, f"❌ كلمة المرور غير صحيحة: {e}")
 
 # ==========================================
-# 5. دالة التشغيل المتوافقة مع المشغل الرئيسي bot.py
+# 5. دالة التشغيل
 # ==========================================
 async def start_bot():
-    print("Bot 3 (Telegram Account Manager) is running...")
+    await sync_from_channel()
+    print("Bot 2 (Userbot Manager) is running with Cloud DB...")
     await bot.polling(non_stop=True)
 
 def run():
-    asyncio.run(start_bot())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_bot())
