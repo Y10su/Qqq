@@ -1,289 +1,62 @@
-import telebot
-import re
 import os
-import json
+import sys
+import threading
+import importlib
+import logging
 from flask import Flask
-from threading import Thread
 
-# ==========================================
-# الإعدادات الأساسية
-# ==========================================
-BOT_TOKEN = "8938474760:AAHBLfDoV_d1D8EKhYmSRocCpVTimbDpUgk"
-PRIMARY_ADMIN_ID = 8145086924  
+# إعداد السجلات (Logs)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
+logger = logging.getLogger("BotRunner")
 
-# ملفات الحفظ
-ADMINS_FILE = "admins.json"
-USERS_FILE = "users.json"
-BANNED_FILE = "banned.json" # ملف لحفظ المحظورين
-
-def load_data(filename, default_data):
-    if os.path.exists(filename):
-        with open(filename, 'r') as f:
-            try:
-                return set(json.load(f))
-            except: pass
-    return default_data
-
-def save_data(filename, data_set):
-    with open(filename, 'w') as f:
-        json.dump(list(data_set), f)
-
-# تحميل البيانات
-ADMINS = load_data(ADMINS_FILE, {PRIMARY_ADMIN_ID})
-USERS = load_data(USERS_FILE, set())
-BANNED = load_data(BANNED_FILE, set())
-
-# تتبع حالات الإدمنية (هل هو يذيع أو يضيف أدمن)
-broadcasting_admins = {}
-adding_admin_state = {}
-
-bot = telebot.TeleBot(BOT_TOKEN)
-
-WELCOME_MESSAGE = """أهلًا بك {name} في بوت قمة للقدرات لتجميع الاقسام  ✨
-
-🔴 يرجى إرسال أي أسئلة أو أفكار تذكرها في اختبارك أو رأيتها في مواقع التواصل وردت في الاختبار، حتى نقوم بتجميعها وتنقيحها ونشرها وإفادة الطلاب 🩵
-
-🔴 تقدر ترسل جزء من السؤال إذا ما تذكره كامل 👌
-
- @Saqimmah"""
-
-# ==========================================
-# أوامر الحظر والإدارة المباشرة
-# ==========================================
-
-@bot.message_handler(commands=['ban'])
-def ban_user(message):
-    if message.chat.id in ADMINS:
-        user_id = None
-        # إذا كان الأدمن يرد على رسالة الطالب
-        if message.reply_to_message and message.reply_to_message.text:
-            match = re.search(r'الآي دي:\s*(\d+)', message.reply_to_message.text)
-            if match:
-                user_id = int(match.group(1))
-        # إذا كتب الآي دي يدوياً بعد الأمر
-        elif len(message.text.split()) > 1:
-            try:
-                user_id = int(message.text.split()[1])
-            except ValueError: pass
-            
-        if user_id:
-            BANNED.add(user_id)
-            save_data(BANNED_FILE, BANNED)
-            bot.reply_to(message, f"🚫 تم حظر الطالب ذو الآي دي `{user_id}` بنجاح ولن تصل رسائله بعد الآن.", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "❌ يرجى الرد على رسالة الطالب بـ /ban أو كتابة الأمر متبوعاً بالآي دي.")
-
-@bot.message_handler(commands=['unban'])
-def unban_user(message):
-    if message.chat.id in ADMINS:
-        user_id = None
-        if message.reply_to_message and message.reply_to_message.text:
-            match = re.search(r'الآي دي:\s*(\d+)', message.reply_to_message.text)
-            if match:
-                user_id = int(match.group(1))
-        elif len(message.text.split()) > 1:
-            try: user_id = int(message.text.split()[1])
-            except ValueError: pass
-            
-        if user_id and user_id in BANNED:
-            BANNED.remove(user_id)
-            save_data(BANNED_FILE, BANNED)
-            bot.reply_to(message, f"✅ تم فك الحظر عن الآي دي `{user_id}`.", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "❌ هذا الطالب غير محظور أو أنك لم تقم بتحديد الآي دي بشكل صحيح.")
-
-@bot.message_handler(commands=['deladmin'])
-def del_admin(message):
-    if message.chat.id == PRIMARY_ADMIN_ID:
-        try:
-            target_admin = int(message.text.split()[1])
-            if target_admin == PRIMARY_ADMIN_ID:
-                bot.reply_to(message, "❌ لا يمكنك حذف نفسك من الإدارة!")
-                return
-            if target_admin in ADMINS:
-                ADMINS.remove(target_admin)
-                save_data(ADMINS_FILE, ADMINS)
-                bot.reply_to(message, f"🗑 تم إزالة الأدمن: `{target_admin}`", parse_mode="Markdown")
-            else:
-                bot.reply_to(message, "❌ هذا الآي دي غير موجود في قائمة الإدمنية.")
-        except Exception:
-            bot.reply_to(message, "❌ خطأ! الطريقة الصحيحة:\n`/deladmin 123456789`", parse_mode="Markdown")
-
-# ==========================================
-# أوامر البوت الأساسية والأزرار
-# ==========================================
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.chat.id
-    
-    if user_id not in USERS:
-        USERS.add(user_id)
-        save_data(USERS_FILE, USERS)
-
-    if user_id in ADMINS:
-        markup = telebot.types.InlineKeyboardMarkup()
-        broadcast_btn = telebot.types.InlineKeyboardButton("📢 إذاعة رسالة للطلاب", callback_data="broadcast_mode")
-        stats_btn = telebot.types.InlineKeyboardButton("📊 عدد المشتركين", callback_data="stats_mode")
-        
-        markup.add(broadcast_btn)
-        
-        # إظهار زر إضافة أدمن للمدير الأساسي فقط
-        if user_id == PRIMARY_ADMIN_ID:
-            add_admin_btn = telebot.types.InlineKeyboardButton("➕ إضافة أدمن", callback_data="add_admin_mode")
-            markup.row(stats_btn, add_admin_btn)
-        else:
-            markup.add(stats_btn)
-            
-        bot.reply_to(message, "أهلاً بك في لوحة الإدارة 👮‍♂️.\n\n👇 للتحكم السريع استخدم الأزرار:", reply_markup=markup)
-    else:
-        if user_id in BANNED: return # لا نرد على المحظورين
-        bot.reply_to(message, WELCOME_MESSAGE.format(name=message.from_user.first_name))
-
-# التعامل مع الأزرار الشفافة
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    if call.data == "broadcast_mode" and call.message.chat.id in ADMINS:
-        adding_admin_state[call.message.chat.id] = False
-        broadcasting_admins[call.message.chat.id] = True
-        bot.edit_message_text(
-            "📢 **وضع الإذاعة مفعل:**\nأرسل الآن الرسالة التي تريد إذاعتها (نص، صورة، أو ملف).\n\nلإلغاء الإذاعة أرسل كلمة: `الغاء`",
-            chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown"
-        )
-    elif call.data == "stats_mode" and call.message.chat.id in ADMINS:
-        bot.answer_callback_query(call.id, f"📊 إجمالي عدد الطلاب المفعلين للبوت: {len(USERS)} طالب", show_alert=True)
-    elif call.data == "add_admin_mode" and call.message.chat.id == PRIMARY_ADMIN_ID:
-        broadcasting_admins[call.message.chat.id] = False
-        adding_admin_state[call.message.chat.id] = True
-        bot.edit_message_text(
-            "➕ **وضع إضافة أدمن:**\nيرجى إرسال الآي دي (ID) الخاص بالأدمن الجديد الآن.\n\nلإلغاء العملية أرسل: `الغاء`",
-            chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown"
-        )
-
-# استقبال حالة إضافة أدمن عبر الزر
-@bot.message_handler(func=lambda message: message.chat.id == PRIMARY_ADMIN_ID and adding_admin_state.get(message.chat.id, False))
-def handle_add_admin_state(message):
-    if message.text == 'الغاء':
-        adding_admin_state[message.chat.id] = False
-        bot.reply_to(message, "❌ تم إلغاء إضافة الأدمن.")
-        return
-    
-    try:
-        new_admin = int(message.text.strip())
-        ADMINS.add(new_admin)
-        save_data(ADMINS_FILE, ADMINS)
-        adding_admin_state[message.chat.id] = False
-        bot.reply_to(message, f"✅ تم إضافة الأدمن بنجاح.\nالآي دي: `{new_admin}`", parse_mode="Markdown")
-    except ValueError:
-        bot.reply_to(message, "❌ الرجاء إرسال أرقام فقط (الآي دي)، أو أرسل 'الغاء'.")
-
-# استقبال رسالة الإذاعة من الأدمن
-@bot.message_handler(func=lambda message: message.chat.id in ADMINS and broadcasting_admins.get(message.chat.id, False), content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker'])
-def handle_broadcast_message(message):
-    if message.content_type == 'text' and message.text == 'الغاء':
-        broadcasting_admins[message.chat.id] = False
-        bot.reply_to(message, "❌ تم إلغاء عملية الإذاعة.")
-        return
-
-    bot.reply_to(message, "⏳ جاري إذاعة الرسالة للطلاب، يرجى الانتظار...")
-    success = 0
-    for user_id in USERS:
-        if user_id not in ADMINS:
-            try:
-                bot.copy_message(user_id, message.chat.id, message.message_id)
-                success += 1
-            except: pass
-                
-    broadcasting_admins[message.chat.id] = False
-    bot.reply_to(message, f"✅ تمت الإذاعة بنجاح ووصلت لـ {success} طالب.")
-
-# ==========================================
-# التواصل واستقبال الرسائل من الطلاب
-# ==========================================
-
-@bot.message_handler(func=lambda message: message.chat.id not in ADMINS, content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker', 'animation', 'video_note', 'location', 'contact'])
-def handle_user_message(message):
-    user_id = message.from_user.id
-    
-    # تجاهل المحظورين تماماً
-    if user_id in BANNED:
-        return
-        
-    first_name = message.from_user.first_name
-    
-    if user_id not in USERS:
-        USERS.add(user_id)
-        save_data(USERS_FILE, USERS)
-        
-    markup = telebot.types.InlineKeyboardMarkup()
-    user_btn = telebot.types.InlineKeyboardButton(f"👤 حساب {first_name}", url=f"tg://user?id={user_id}")
-    markup.add(user_btn)
-    
-    bot.reply_to(message, "✅ تم استلام رسالتك وإرسالها للإدارة بنجاح.")
-    
-    for admin in ADMINS:
-        try:
-            if message.content_type == 'text':
-                text = f"📩 رسالة من: {first_name}\nالآي دي: `{user_id}`\n\n{message.text}"
-                bot.send_message(admin, text, parse_mode="Markdown", reply_markup=markup)
-            else:
-                copied = bot.copy_message(admin, message.chat.id, message.message_id)
-                bot.send_message(admin, f"👆 المرفق أعلاه من: {first_name}\nالآي دي: `{user_id}`", parse_mode="Markdown", reply_markup=markup, reply_to_message_id=copied.message_id)
-        except Exception: pass
-
-@bot.message_handler(func=lambda message: message.chat.id in ADMINS and message.reply_to_message)
-def reply_to_user(message):
-    # تجاهل الردود إذا كان الأدمن يستخدم أوامر
-    if message.text and message.text.startswith('/'):
-        return
-        
-    reply_text = message.reply_to_message.text
-    user_id = None
-    
-    if reply_text and "الآي دي:" in reply_text:
-        match = re.search(r'الآي دي:\s*(\d+)', reply_text)
-        if match: user_id = int(match.group(1))
-            
-    if user_id:
-        try:
-            if message.content_type == 'text':
-                bot.send_message(user_id, message.text)
-            else:
-                bot.copy_message(user_id, message.chat.id, message.message_id)
-                
-            bot.reply_to(message, "✅ تم إرسال الرد للطالب بنجاح.")
-            
-            admin_name = message.from_user.first_name
-            for admin in ADMINS:
-                if str(admin) != str(message.chat.id):
-                    if message.content_type == 'text':
-                        bot.send_message(admin, f"🔔 الإدمن **{admin_name}** رد على الآي دي: `{user_id}`\n\nنص الرد:\n{message.text}", parse_mode="Markdown")
-                    else:
-                        copied = bot.copy_message(admin, message.chat.id, message.message_id)
-                        bot.send_message(admin, f"🔔👆 الإدمن **{admin_name}** أرسل المرفق أعلاه للآي دي: `{user_id}`", parse_mode="Markdown", reply_to_message_id=copied.message_id)
-        except Exception:
-            bot.reply_to(message, "❌ فشل الإرسال، قد يكون الطالب حظر البوت.")
-    else:
-        bot.reply_to(message, "❌ تأكد أنك ترد (Reply) على رسالة تحتوي على الآي دي.")
-
-# ==========================================
-# إعداد الخادم (Port Bind) ليتوافق مع Render
-# ==========================================
+# 1. إعداد خادم Flask للربط مع Render ومنفذ الخدمة (Keep-Alive)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive and running!"
+    return "✅ السيرفر يعمل بنجاح والبوتات نشطة!"
 
-def run():
-    port = int(os.environ.get("PORT", 10000))
+@app.route('/health')
+def health():
+    return {"status": "ok", "message": "Service is running"}, 200
+
+def run_flask_server():
+    # قراءة المنفذ تلقائياً من إعدادات Render أو استخدام 8080 كافتراضي
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"🚀 بدء تشغيل خادم الويب على المنفذ: {port}")
     app.run(host="0.0.0.0", port=port)
 
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+def safe_start_bot(module_name):
+    """دالة لمحاولة استدعاء وتشغيل البوت بأمان بدون كراش إذا كان الملف فارغاً أو غير موجود"""
+    try:
+        # استدعاء الملف بشكل ديناميكي
+        bot_module = importlib.import_module(module_name)
+        
+        # التأكد من وجود دالة التشغيل run داخل الملف
+        if hasattr(bot_module, "run") and callable(getattr(bot_module, "run")):
+            logger.info(f"▶️ جاري تشغيل البوت: [{module_name}.py] ...")
+            try:
+                bot_module.run()
+            except Exception as e:
+                logger.error(f"❌ خطأ أثناء تشغيل البوت [{module_name}]: {e}")
+        else:
+            logger.warning(f"⚠️ الملف [{module_name}.py] موجود لكن لا يحتوي على دالة run() أو فارغ - تم تخطيه بأمان.")
+            
+    except ModuleNotFoundError:
+        logger.info(f"ℹ️ الملف [{module_name}.py] غير موجود - تم التخطي.")
+    except Exception as e:
+        logger.error(f"❌ حدث خطأ في تحميل الملف [{module_name}]: {e} - تم إكمال التشغيل لبقية البوتات.")
 
 if __name__ == "__main__":
-    keep_alive()
-    print("Bot is running...")
-    bot.infinity_polling()
+    logger.info("⚡ بدء تشغيل السيرفر الموحد وإدارة البوتات...")
+
+    # قائمة ملفات البوتات الفرعية فقط: من bot1 إلى bot10
+    bot_modules = [f"bot{i}" for i in range(1, 11)]
+
+    # تشغيل كل بوت في خيط مستقل (Thread) معزول تماماً
+    for module_name in bot_modules:
+        bot_thread = threading.Thread(target=safe_start_bot, args=(module_name,), daemon=True)
+        bot_thread.start()
+
+    # تشغيل سيرفر الويب لـ Render لإبقاء الخدمة متصلة بالبورت
+    run_flask_server()
