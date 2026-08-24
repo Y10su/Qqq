@@ -1,7 +1,9 @@
-bot2_final_code = '''import telebot
+import telebot
 import re
 import os
 import json
+import asyncio
+import time
 
 # ==========================================
 # الإعدادات الأساسية
@@ -30,7 +32,7 @@ def sync_from_channel():
         chat = bot.get_chat(DB_CHANNEL_ID)
         if chat.pinned_message and chat.pinned_message.text:
             text = chat.pinned_message.text
-            match = re.search(r'```json\\n(.*?)\\n```', text, re.DOTALL)
+            match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
             if match:
                 data = json.loads(match.group(1))
                 DB_STATE["admins"] = list(set(data.get("admins", [PRIMARY_ADMIN_ID])))
@@ -39,14 +41,14 @@ def sync_from_channel():
                 print("✅ تم استرجاع قاعدة البيانات بنجاح من القناة.")
                 return
     except Exception as e:
-        print(f"⚠️ تعذر قراءة قاعدة البيانات القديمة: {e}")
+        print(f"⚠️ تعذر قراءة قاعدة البيانات: {e}")
 
     save_to_channel()
 
 def save_to_channel():
     """حفظ البيانات وتحديثها في القناة مباشرة"""
     payload = json.dumps(DB_STATE, indent=2)
-    formatted_text = f"📦 **نسخة قاعدة البيانات المحدثة**\\n\\n```json\\n{payload}\\n```"
+    formatted_text = f"📦 **نسخة قاعدة البيانات المحدثة**\n\n```json\n{payload}\n```"
     try:
         chat = bot.get_chat(DB_CHANNEL_ID)
         if chat.pinned_message:
@@ -61,9 +63,6 @@ def save_to_channel():
             bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
     except Exception as e:
         print(f"❌ خطأ أثناء المزامنة مع القناة: {e}")
-
-# مزامنة البيانات الأولية
-sync_from_channel()
 
 broadcasting_admins = {}
 adding_admin_state = {}
@@ -85,7 +84,7 @@ def ban_user(message):
     if message.chat.id in DB_STATE["admins"]:
         user_id = None
         if message.reply_to_message and message.reply_to_message.text:
-            match = re.search(r'الآي دي:\\s*(\\d+)', message.reply_to_message.text)
+            match = re.search(r'الآي دي:\s*(\d+)', message.reply_to_message.text)
             if match:
                 user_id = int(match.group(1))
         elif len(message.text.split()) > 1:
@@ -106,7 +105,7 @@ def unban_user(message):
     if message.chat.id in DB_STATE["admins"]:
         user_id = None
         if message.reply_to_message and message.reply_to_message.text:
-            match = re.search(r'الآي دي:\\s*(\\d+)', message.reply_to_message.text)
+            match = re.search(r'الآي دي:\s*(\d+)', message.reply_to_message.text)
             if match:
                 user_id = int(match.group(1))
         elif len(message.text.split()) > 1:
@@ -135,7 +134,7 @@ def del_admin(message):
             else:
                 bot.reply_to(message, "❌ هذا الآي دي غير موجود في قائمة الإدمنية.")
         except Exception:
-            bot.reply_to(message, "❌ خطأ! الطريقة الصحيحة:\\n`/deladmin 123456789`", parse_mode="Markdown")
+            bot.reply_to(message, "❌ خطأ! الطريقة الصحيحة:\n`/deladmin 123456789`", parse_mode="Markdown")
 
 # ==========================================
 # أوامر البوت الأساسية والأزرار
@@ -162,7 +161,7 @@ def send_welcome(message):
         else:
             markup.add(stats_btn)
             
-        bot.reply_to(message, "أهلاً بك في لوحة الإدارة 👮‍♂️.\\n\\n👇 للتحكم السريع استخدم الأزرار:", reply_markup=markup)
+        bot.reply_to(message, "أهلاً بك في لوحة الإدارة 👮‍♂️.\n\n👇 للتحكم السريع استخدم الأزرار:", reply_markup=markup)
     else:
         if user_id in DB_STATE["banned"]: return
         bot.reply_to(message, WELCOME_MESSAGE.format(name=message.from_user.first_name))
@@ -173,7 +172,7 @@ def callback_query(call):
         adding_admin_state[call.message.chat.id] = False
         broadcasting_admins[call.message.chat.id] = True
         bot.edit_message_text(
-            "📢 **وضع الإذاعة مفعل:**\\nأرسل الآن الرسالة التي تريد إذاعتها (نص، صورة، أو ملف).\\n\\nلإلغاء الإذاعة أرسل كلمة: `الغاء`",
+            "📢 **وضع الإذاعة مفعل:**\nأرسل الآن الرسالة التي تريد إذاعتها (نص، صورة، أو ملف).\n\nلإلغاء الإذاعة أرسل كلمة: `الغاء`",
             chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown"
         )
     elif call.data == "stats_mode" and call.message.chat.id in DB_STATE["admins"]:
@@ -182,7 +181,7 @@ def callback_query(call):
         broadcasting_admins[call.message.chat.id] = False
         adding_admin_state[call.message.chat.id] = True
         bot.edit_message_text(
-            "➕ **وضع إضافة أدمن:**\\nيرجى إرسال الآي دي (ID) الخاص بالأدمن الجديد الآن.\\n\\nلإلغاء العملية أرسل: `الغاء`",
+            "➕ **وضع إضافة أدمن:**\nيرجى إرسال الآي دي (ID) الخاص بالأدمن الجديد الآن.\n\nلإلغاء العملية أرسل: `الغاء`",
             chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown"
         )
 
@@ -199,7 +198,7 @@ def handle_add_admin_state(message):
             DB_STATE["admins"].append(new_admin)
             save_to_channel()
         adding_admin_state[message.chat.id] = False
-        bot.reply_to(message, f"✅ تم إضافة الأدمن بنجاح.\\nالآي دي: `{new_admin}`", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ تم إضافة الأدمن بنجاح.\nالآي دي: `{new_admin}`", parse_mode="Markdown")
     except ValueError:
         bot.reply_to(message, "❌ الرجاء إرسال أرقام فقط (الآي دي)، أو أرسل 'الغاء'.")
 
@@ -248,11 +247,11 @@ def handle_user_message(message):
     for admin in DB_STATE["admins"]:
         try:
             if message.content_type == 'text':
-                text = f"📩 رسالة من: {first_name}\\nالآي دي: `{user_id}`\\n\\n{message.text}"
+                text = f"📩 رسالة من: {first_name}\nالآي دي: `{user_id}`\n\n{message.text}"
                 bot.send_message(admin, text, parse_mode="Markdown", reply_markup=markup)
             else:
                 copied = bot.copy_message(admin, message.chat.id, message.message_id)
-                bot.send_message(admin, f"👆 المرفق أعلاه من: {first_name}\\nالآي دي: `{user_id}`", parse_mode="Markdown", reply_markup=markup, reply_to_message_id=copied.message_id)
+                bot.send_message(admin, f"👆 المرفق أعلاه من: {first_name}\nالآي دي: `{user_id}`", parse_mode="Markdown", reply_markup=markup, reply_to_message_id=copied.message_id)
         except Exception: pass
 
 @bot.message_handler(func=lambda message: message.chat.id in DB_STATE["admins"] and message.reply_to_message)
@@ -264,7 +263,7 @@ def reply_to_user(message):
     user_id = None
     
     if reply_text and "الآي دي:" in reply_text:
-        match = re.search(r'الآي دي:\\s*(\\d+)', reply_text)
+        match = re.search(r'الآي دي:\s*(\d+)', reply_text)
         if match: user_id = int(match.group(1))
             
     if user_id:
@@ -280,7 +279,7 @@ def reply_to_user(message):
             for admin in DB_STATE["admins"]:
                 if str(admin) != str(message.chat.id):
                     if message.content_type == 'text':
-                        bot.send_message(admin, f"🔔 الإدمن **{admin_name}** رد على الآي دي: `{user_id}`\\n\\nنص الرد:\\n{message.text}", parse_mode="Markdown")
+                        bot.send_message(admin, f"🔔 الإدمن **{admin_name}** رد على الآي دي: `{user_id}`\n\nنص الرد:\n{message.text}", parse_mode="Markdown")
                     else:
                         copied = bot.copy_message(admin, message.chat.id, message.message_id)
                         bot.send_message(admin, f"🔔👆 الإدمن **{admin_name}** أرسل المرفق أعلاه للآي دي: `{user_id}`", parse_mode="Markdown", reply_to_message_id=copied.message_id)
@@ -290,14 +289,20 @@ def reply_to_user(message):
         bot.reply_to(message, "❌ تأكد أنك ترد (Reply) على رسالة تحتوي على الآي دي.")
 
 # ==========================================
-# دالة التشغيل المتوافقة مع المشغل الرئيسي bot.py
+# دالة التشغيل المتوافقة مع Thread و Event Loop
 # ==========================================
 def run():
-    print("Bot 2 (Saqimmah) is running with Telegram Channel Cloud DB...")
-    bot.infinity_polling(timeout=20, long_polling_timeout=20)
-'''
-
-with open("bot2.py", "w", encoding="utf-8") as f:
-    f.write(bot2_final_code)
-
-print("File bot2.py updated successfully with channel ID.")
+    # إنشاء loop غير متزامنة مخصصة للـ Thread لتفادي تعليق telebot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # مزامنة البيانات مع القناة السحابية
+    sync_from_channel()
+    
+    print("Bot 2 (Saqimmah) is running with Event Loop & Channel DB...")
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            print(f"Polling error: {e}, retrying in 5 seconds...")
+            time.sleep(5)
