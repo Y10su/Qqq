@@ -1,62 +1,59 @@
 import os
-import sys
 import threading
-import importlib
-import logging
+import time
 from flask import Flask
 
-# إعداد السجلات (Logs)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
-logger = logging.getLogger("BotRunner")
+# استيراد ملفات البوتات
+try:
+    import bot1
+except ImportError:
+    bot1 = None
 
-# 1. إعداد خادم Flask للربط مع Render ومنفذ الخدمة (Keep-Alive)
+try:
+    import bot2
+except ImportError:
+    bot2 = None
+
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ السيرفر يعمل بنجاح والبوتات نشطة!"
+    return "Bots are running successfully!"
 
-@app.route('/health')
-def health():
-    return {"status": "ok", "message": "Service is running"}, 200
-
-def run_flask_server():
-    # قراءة المنفذ تلقائياً من إعدادات Render أو استخدام 8080 كافتراضي
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"🚀 بدء تشغيل خادم الويب على المنفذ: {port}")
-    app.run(host="0.0.0.0", port=port)
-
-def safe_start_bot(module_name):
-    """دالة لمحاولة استدعاء وتشغيل البوت بأمان بدون كراش إذا كان الملف فارغاً أو غير موجود"""
-    try:
-        # استدعاء الملف بشكل ديناميكي
-        bot_module = importlib.import_module(module_name)
-        
-        # التأكد من وجود دالة التشغيل run داخل الملف
-        if hasattr(bot_module, "run") and callable(getattr(bot_module, "run")):
-            logger.info(f"▶️ جاري تشغيل البوت: [{module_name}.py] ...")
+def run_bot1():
+    if bot1 and hasattr(bot1, 'run'):
+        print("[INFO] Starting Bot 1 (Saqimmah)...")
+        while True:
             try:
-                bot_module.run()
+                bot1.run()
             except Exception as e:
-                logger.error(f"❌ خطأ أثناء تشغيل البوت [{module_name}]: {e}")
-        else:
-            logger.warning(f"⚠️ الملف [{module_name}.py] موجود لكن لا يحتوي على دالة run() أو فارغ - تم تخطيه بأمان.")
+                print(f"[ERROR] Bot 1 crashed: {e}. Restarting in 10 seconds...")
+                time.sleep(10)
+
+def run_bot2():
+    if bot2 and hasattr(bot2, 'run'):
+        print("[INFO] Starting Bot 2 (Userbot Manager)...")
+        while True:
+            try:
+                bot2.run()
+            except Exception as e:
+                print(f"[ERROR] Bot 2 crashed: {e}. Restarting in 10 seconds...")
+                time.sleep(10)
+
+if __name__ == '__main__':
+    # تأكد من أننا نشغل البوتات مرة واحدة فقط لتفادي خطأ 409
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        print("[INFO] Initializing bots threads...")
+        
+        if bot1:
+            t1 = threading.Thread(target=run_bot1, daemon=True)
+            t1.start()
             
-    except ModuleNotFoundError:
-        logger.info(f"ℹ️ الملف [{module_name}.py] غير موجود - تم التخطي.")
-    except Exception as e:
-        logger.error(f"❌ حدث خطأ في تحميل الملف [{module_name}]: {e} - تم إكمال التشغيل لبقية البوتات.")
+        if bot2:
+            t2 = threading.Thread(target=run_bot2, daemon=True)
+            t2.start()
 
-if __name__ == "__main__":
-    logger.info("⚡ بدء تشغيل السيرفر الموحد وإدارة البوتات...")
-
-    # قائمة ملفات البوتات الفرعية فقط: من bot1 إلى bot10
-    bot_modules = [f"bot{i}" for i in range(1, 11)]
-
-    # تشغيل كل بوت في خيط مستقل (Thread) معزول تماماً
-    for module_name in bot_modules:
-        bot_thread = threading.Thread(target=safe_start_bot, args=(module_name,), daemon=True)
-        bot_thread.start()
-
-    # تشغيل سيرفر الويب لـ Render لإبقاء الخدمة متصلة بالبورت
-    run_flask_server()
+    # تشغيل خادم الويب
+    port = int(os.environ.get('PORT', 10000))
+    # نستخدم use_reloader=False لمنع Flask من تشغيل الكود مرتين
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
