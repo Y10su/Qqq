@@ -51,7 +51,7 @@ async def sync_from_channel():
                         accounts = data.get("accounts", {})
                         for phone, info in accounts.items():
                             if isinstance(info, str):
-                                accounts[phone] = {"session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False, "autopost": [], "storage_chat_id": None, "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}, "cached_groups": [], "shortcuts": {}}
+                                accounts[phone] = {"session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False, "autopost": [], "storage_chat_id": None, "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}, "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}}
                             else:
                                 if "auto_save" not in info: info["auto_save"] = False
                                 if "autopost" not in info or isinstance(info["autopost"], dict): info["autopost"] = []
@@ -59,6 +59,7 @@ async def sync_from_channel():
                                 if "auto_reply" not in info: info["auto_reply"] = {"active": False, "msg": "", "cooldown_hours": 3}
                                 if "cached_groups" not in info: info["cached_groups"] = []
                                 if "shortcuts" not in info: info["shortcuts"] = {}
+                                if "exceptions" not in info: info["exceptions"] = {"storage": [], "autoreply": []}
                         DB_STATE["accounts"] = accounts
                         print(f"✅ تم استرجاع {len(DB_STATE['accounts'])} حساب محفوظ.")
                         return
@@ -105,17 +106,6 @@ async def fetch_account_groups(client):
         pass
     return groups
 
-async def create_storage_group(client):
-    try:
-        chat = await client.create_supergroup("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص وحفظ الميديا هنا تلقائياً")
-        return chat.id
-    except:
-        try:
-            chat = await client.create_channel("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص وحفظ الميديا هنا تلقائياً")
-            return chat.id
-        except:
-            return None
-
 async def download_telebot_media(message):
     file_id = None
     ext = ".tmp"
@@ -137,7 +127,6 @@ async def download_telebot_media(message):
     return path
 
 async def handle_user_shortcuts(client, message):
-    """استبدال الاختصارات إذا كتبها صاحب الحساب بنفسه"""
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
     
@@ -151,7 +140,6 @@ async def handle_user_shortcuts(client, message):
                 await message.edit_text(shortcut["text"])
             elif shortcut["type"] == "media":
                 await message.delete()
-                # جلب الرسالة من مجموعة التخزين وإرسالها
                 await client.copy_message(message.chat.id, shortcut.get("chat_id", "me"), shortcut["msg_id"])
         except Exception as e:
             pass
@@ -161,6 +149,24 @@ async def handle_private_messages(client, message):
     if not phone: return
     acc_info = DB_STATE["accounts"].get(phone, {})
     
+    # 1. الاستثناءات
+    my_id = getattr(client, "my_id", None)
+    user_id = message.from_user.id if message.from_user else None
+    username = message.from_user.username if message.from_user else None
+    
+    exceptions = acc_info.get("exceptions", {"storage": [], "autoreply": []})
+    
+    is_storage_exc = False
+    if user_id in exceptions["storage"] or (username and f"@{username}" in exceptions["storage"]) or (username and username in exceptions["storage"]):
+        is_storage_exc = True
+        
+    is_reply_exc = False
+    if user_id == my_id: # استثناء الرسائل المحفوظة من الرد التلقائي
+        is_reply_exc = True
+    elif user_id in exceptions["autoreply"] or (username and f"@{username}" in exceptions["autoreply"]) or (username and username in exceptions["autoreply"]):
+        is_reply_exc = True
+
+    # 2. صيد الذاتية (للمحفوظات)
     is_ttl = False
     if getattr(message, "ttl_seconds", None): is_ttl = True
     elif message.photo and getattr(message.photo, "ttl_seconds", None): is_ttl = True
@@ -168,7 +174,6 @@ async def handle_private_messages(client, message):
     elif message.voice and getattr(message.voice, "ttl_seconds", None): is_ttl = True
     elif message.video_note and getattr(message.video_note, "ttl_seconds", None): is_ttl = True
 
-    # صيد الذاتية يرسلها إلى "me" (الرسائل المحفوظة)
     if is_ttl and acc_info.get("auto_save"):
         try:
             path = await message.download()
@@ -183,17 +188,16 @@ async def handle_private_messages(client, message):
                 os.remove(path)
         except: pass
 
-    # تحويل رسائل الخاص العادية إلى مجموعة التخزين
+    # 3. تحويل رسائل الخاص العادية إلى مجموعة التخزين
     storage_id = acc_info.get("storage_chat_id")
-    if storage_id and not is_ttl:
+    if storage_id and not is_ttl and not is_storage_exc:
         try:
             await message.forward(storage_id)
         except: pass
 
-    # الرد التلقائي
+    # 4. الرد التلقائي
     auto_reply = acc_info.get("auto_reply", {})
-    if auto_reply.get("active") and auto_reply.get("msg") and message.from_user:
-        user_id = message.from_user.id
+    if auto_reply.get("active") and auto_reply.get("msg") and user_id and not is_reply_exc:
         cooldown_sec = auto_reply.get("cooldown_hours", 3) * 3600
         if phone not in LAST_REPLY_TIME: LAST_REPLY_TIME[phone] = {}
         
@@ -217,6 +221,7 @@ async def start_active_sessions():
             
             try:
                 await client.start()
+                client.my_id = (await client.get_me()).id # تخزين آيدي الحساب لاستخدامه بالاستثناءات
                 RUNNING_CLIENTS[phone] = client
                 print(f"✅ الحساب {phone} متصل وجاهز.")
             except Exception as e:
@@ -296,34 +301,70 @@ async def callbacks(call):
         
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
-        storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
         
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(f"📥 حفظ الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
         markup.add(InlineKeyboardButton(f"🔄 مهام النشر", callback_data=f"autopost_{phone}"), InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"))
-        markup.add(InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"))
-        markup.add(InlineKeyboardButton("⚙️ إعداد الرد التلقائي", callback_data=f"autoreply_setup_{phone}"), InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
+        markup.add(InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"), InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"))
+        markup.add(InlineKeyboardButton("🛡 إدارة الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton("🛠 مجموعة التخزين", callback_data=f"fixstorage_{phone}"))
         markup.add(InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"), InlineKeyboardButton("✍️ النبذة", callback_data=f"bio_{phone}"))
         markup.add(InlineKeyboardButton("🗑 حذف الحساب", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
         
         await bot.edit_message_text(f"⚙️ **تحكم حساب: `{phone}`**\nيمكنك التحكم بكافة خصائص الحساب من هنا.", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
+    # --- تحقق وإنشاء مجموعة التخزين ---
     elif data.startswith("fixstorage_"):
         phone = data.split("_")[1]
         client = RUNNING_CLIENTS.get(phone)
         if not client:
             await bot.answer_callback_query(call.id, "الحساب غير متصل حالياً!", show_alert=True)
             return
-        await bot.answer_callback_query(call.id, "⏳ جاري إنشاء وربط مجموعة التخزين...")
-        s_id = await create_storage_group(client)
-        if s_id:
-            DB_STATE["accounts"][phone]["storage_chat_id"] = s_id
-            await save_to_channel()
-            call.data = f"panel_{phone}"
-            await callbacks(call)
-        else:
-            await bot.send_message(user_id, "❌ فشل إنشاء مجموعة التخزين (قد يكون الحساب محظور من إنشاء مجموعات).")
 
+        storage_id = DB_STATE["accounts"][phone].get("storage_chat_id")
+        if storage_id:
+            try:
+                chat = await client.get_chat(storage_id)
+                await bot.answer_callback_query(call.id, "✅ مجموعة التخزين موجودة وتعمل بشكل سليم!", show_alert=True)
+                return
+            except:
+                pass # الوصول مرفوض أو محذوفة، سيكمل للإنشاء
+
+        await bot.answer_callback_query(call.id, "⏳ جاري إنشاء المجموعة...")
+        try:
+            chat = await client.create_supergroup("مجموعة التخزين 📁", "مجموعة قاعدة البيانات الخاصة بالحساب.")
+            storage_id = chat.id
+            link = chat.invite_link or (await chat.export_invite_link())
+        except:
+            try:
+                chat = await client.create_channel("مجموعة التخزين 📁", "مجموعة قاعدة البيانات الخاصة بالحساب.")
+                storage_id = chat.id
+                link = chat.invite_link or (await chat.export_invite_link())
+            except Exception as e:
+                await bot.send_message(user_id, f"❌ فشل إنشاء مجموعة التخزين: {e}")
+                return
+
+        DB_STATE["accounts"][phone]["storage_chat_id"] = storage_id
+        await save_to_channel()
+        await bot.send_message(user_id, f"✅ تم إنشاء مجموعة التخزين بنجاح!\n🔗 الرابط: {link}\n*(لا تقم بحذفها لأنها تعمل كقاعدة بيانات لميديا حسابك)*", parse_mode="Markdown")
+
+    # --- إدارة الاستثناءات ---
+    elif data.startswith("exceptions_"):
+        phone = data.split("_")[1]
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛡 استثناء من التخزين", callback_data=f"exc_storage_{phone}"))
+        markup.add(InlineKeyboardButton("💬 استثناء من الرد التلقائي", callback_data=f"exc_autoreply_{phone}"))
+        markup.add(InlineKeyboardButton("🔙 رجوع", callback_data=f"panel_{phone}"))
+        await bot.edit_message_text(f"🛡 **إدارة الاستثناءات - `{phone}`**\nيمكنك إضافة وإزالة أشخاص (عبر الآيدي أو اليوزرنيم) لكي يتجاهلهم البوت:", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("exc_"):
+        parts = data.split("_")
+        exc_type = parts[1]
+        phone = parts[2]
+        user_states[user_id] = {"step": "add_exception", "phone": phone, "exc_type": exc_type}
+        await bot.send_message(user_id, "✍️ **أرسل الآي دي (ID) أو المعرف (@username) للمستثنى:**\n(ملاحظة: إذا أرسلته وهو موجود، سيتم حذفه من القائمة)\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
+        await bot.answer_callback_query(call.id)
+
+    # --- إدارة الذاتية ---
     elif data.startswith("autosave_"):
         phone = data.split("_")[1]
         current_status = DB_STATE["accounts"][phone].get("auto_save", False)
@@ -562,8 +603,34 @@ async def handle_inputs(message):
     state = user_states[user_id]
     step = state.get("step")
 
-    # --- إضافة الاختصارات ---
-    if step == "shortcut_kw":
+    # --- إضافة الاختصارات والاستثناءات ---
+    if step == "add_exception":
+        phone = state["phone"]
+        exc_type = state["exc_type"]
+        target = message.text.strip()
+        
+        client = RUNNING_CLIENTS.get(phone)
+        target_id = target
+        try:
+            if client:
+                user_obj = await client.get_users(target)
+                target_id = user_obj.id
+            else:
+                target_id = int(target) if target.isdigit() else target
+        except:
+            target_id = target # حفظها كنص إذا فشل المعرف
+            
+        if target_id not in DB_STATE["accounts"][phone]["exceptions"][exc_type]:
+            DB_STATE["accounts"][phone]["exceptions"][exc_type].append(target_id)
+            await save_to_channel()
+            await bot.reply_to(message, f"✅ تم إضافة `{target}` إلى قائمة الاستثناءات بنجاح!", parse_mode="Markdown")
+        else:
+            DB_STATE["accounts"][phone]["exceptions"][exc_type].remove(target_id)
+            await save_to_channel()
+            await bot.reply_to(message, f"🗑 تم إزالة `{target}` من قائمة الاستثناءات.", parse_mode="Markdown")
+        user_states.pop(user_id, None)
+
+    elif step == "shortcut_kw":
         kw = message.text.strip()
         state["keyword"] = kw
         state["step"] = "shortcut_media"
@@ -592,11 +659,9 @@ async def handle_inputs(message):
             if path:
                 try:
                     caption = message.caption or ""
-                    
-                    # نستخدم مجموعة التخزين لحفظ الميديا، وإذا لم توجد نستخدم me كاحتياط
                     storage_chat_id = DB_STATE["accounts"][phone].get("storage_chat_id")
                     if not storage_chat_id:
-                        storage_chat_id = "me"
+                        storage_chat_id = "me" # احتياط
 
                     if message.photo: msg_s = await client.send_photo(storage_chat_id, path, caption=caption)
                     elif message.video: msg_s = await client.send_video(storage_chat_id, path, caption=caption)
@@ -618,7 +683,7 @@ async def handle_inputs(message):
                     if os.path.exists(path):
                         os.remove(path)
             else:
-                await bot.reply_to(message, "❌ نوع الملف غير مدعوم أو غير مقروء.")
+                await bot.reply_to(message, "❌ نوع الملف غير مدعوم.")
 
     # [تسجيل الدخول و إنشاء مجموعة التخزين]
     elif step == "phone":
@@ -647,14 +712,14 @@ async def handle_inputs(message):
                 "session": session, "owner_id": user_id, "auto_save": False, 
                 "autopost": [], "storage_chat_id": storage_chat_id,
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
-                "cached_groups": [], "shortcuts": {}
+                "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}
             }
             await save_to_channel()
             await client.disconnect()
             await start_active_sessions()
             user_states.pop(user_id, None)
             msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
-            msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يمكنك إنشائها يدوياً من الإعدادات."
+            msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يرجى إنشائها من الإعدادات."
             await bot.reply_to(message, msg_reply, parse_mode="Markdown")
         except SessionPasswordNeeded:
             user_states[user_id]["step"] = "2fa"
@@ -674,14 +739,14 @@ async def handle_inputs(message):
                 "session": session, "owner_id": user_id, "auto_save": False, 
                 "autopost": [], "storage_chat_id": storage_chat_id,
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
-                "cached_groups": [], "shortcuts": {}
+                "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}
             }
             await save_to_channel()
             await client.disconnect()
             await start_active_sessions()
             user_states.pop(user_id, None)
             msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
-            msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يمكنك إنشائها يدوياً من الإعدادات."
+            msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يرجى إنشائها من الإعدادات."
             await bot.reply_to(message, msg_reply, parse_mode="Markdown")
         except Exception as e:
             await bot.reply_to(message, f"❌ كلمة المرور خطأ: {e}")
