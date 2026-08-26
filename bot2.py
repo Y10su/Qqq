@@ -4,7 +4,6 @@ import json
 import re
 import time
 import random
-import tempfile  # إضافة للتعديل الأول
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client, filters
@@ -106,10 +105,9 @@ async def save_to_channel(create_new=False):
 # ==========================================
 
 async def fetch_account_groups(client):
-    """جلب جميع القروبات (بدون حد)"""
     groups = []
     try:
-        async for d in client.get_dialogs(limit=0):  # 0 = الكل
+        async for d in client.get_dialogs(limit=200):
             if d.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
                 groups.append({"id": d.chat.id, "title": d.chat.title})
     except: pass
@@ -128,7 +126,6 @@ async def create_storage_group(client):
         except: return None, None
 
 async def download_telebot_media(message):
-    """تحميل الميديا إلى مجلد tmp لتجنب تراكم الملفات"""
     file_id = None
     ext = ".tmp"
     if message.photo: file_id = message.photo[-1].file_id; ext = ".jpg"
@@ -143,8 +140,7 @@ async def download_telebot_media(message):
     file_info = await bot.get_file(file_id)
     downloaded_file = await bot.download_file(file_info.file_path)
     
-    tmp_dir = tempfile.gettempdir()
-    path = os.path.join(tmp_dir, f"temp_media_{int(time.time())}_{random.randint(1000,9999)}{ext}")
+    path = f"temp_media_{int(time.time())}_{random.randint(1000,9999)}{ext}"
     with open(path, 'wb') as new_file:
         new_file.write(downloaded_file)
     return path
@@ -175,9 +171,6 @@ async def handle_user_shortcuts(client, message):
         except Exception as e:
             pass
 
-# ===================================================================
-# ********** الجزء المُعدَّل لحفظ الذاتية (مع إعادة المحاولة) **********
-# ===================================================================
 async def handle_private_messages(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
@@ -201,40 +194,27 @@ async def handle_private_messages(client, message):
     elif user_id_str in exceptions["autoreply"] or (username and username in exceptions["autoreply"]):
         is_reply_exc = True
 
-    # التحقق من الذاتية (TTL) بشكل مباشر
-    is_ttl = bool(message.ttl_seconds)
+    is_ttl = False
+    if getattr(message, "ttl_seconds", None): is_ttl = True
+    elif message.photo and getattr(message.photo, "ttl_seconds", None): is_ttl = True
+    elif message.video and getattr(message.video, "ttl_seconds", None): is_ttl = True
+    elif message.voice and getattr(message.voice, "ttl_seconds", None): is_ttl = True
+    elif message.video_note and getattr(message.video_note, "ttl_seconds", None): is_ttl = True
 
-    # ====== حفظ الذاتية (مع إعادة محاولة قوية) ======
     if is_ttl and acc_info.get("auto_save"):
-        path = None
-        for attempt in range(3):  # 3 محاولات
-            try:
-                path = await message.download()
-                if path and os.path.exists(path):
-                    sender_name = user.first_name if user else "مجهول"
-                    caption = f"🤫 **تم صيد رسالة ذاتية التدمير!**\nالمرسل: {sender_name}"
-                    if message.photo:
-                        await client.send_photo("me", path, caption=caption)
-                    elif message.video:
-                        await client.send_video("me", path, caption=caption)
-                    elif message.voice:
-                        await client.send_voice("me", path, caption=caption)
-                    elif message.video_note:
-                        await client.send_video_note("me", path)
-                    else:
-                        await client.send_document("me", path, caption=caption)
-                    break
-                else:
-                    await asyncio.sleep(1)
-            except Exception as e:
-                print(f"⚠️ محاولة {attempt+1} فشلت لحفظ الذاتية من {phone}: {e}")
-                await asyncio.sleep(1)
-            finally:
-                if path and os.path.exists(path):
-                    try: os.remove(path)
-                    except: pass
+        try:
+            path = await message.download()
+            if path:
+                sender_name = user.first_name if user else "مجهول"
+                caption = f"🤫 **تم صيد رسالة ذاتية التدمير!**\nالمرسل: {sender_name}"
+                if message.photo: await client.send_photo("me", path, caption=caption)
+                elif message.video: await client.send_video("me", path, caption=caption)
+                elif message.voice: await client.send_voice("me", path, caption=caption)
+                elif message.video_note: await client.send_video_note("me", path)
+                else: await client.send_document("me", path, caption=caption)
+                os.remove(path)
+        except: pass
 
-    # ====== تحويل الرسائل العادية إلى مجموعة التخزين ======
     storage_id = acc_info.get("storage_chat_id")
     if storage_id and not is_ttl and not is_storage_exc:
         try:
@@ -247,7 +227,6 @@ async def handle_private_messages(client, message):
                     await message.forward(int(storage_id))
                 except: pass
 
-    # ====== الرد التلقائي (مع حفظ غير متزامن) ======
     auto_reply = acc_info.get("auto_reply", {})
     if auto_reply.get("active") and auto_reply.get("msg") and not is_reply_exc and not is_ttl:
         cooldown_sec = auto_reply.get("cooldown_hours", 3) * 3600
@@ -259,139 +238,95 @@ async def handle_private_messages(client, message):
             try:
                 await client.send_message(user.id, auto_reply["msg"])
                 DB_STATE["accounts"][phone]["last_replies"][user_id_str] = current_time 
-                asyncio.create_task(save_to_channel())  # حفظ غير متزامن
+                await save_to_channel()
             except: pass
-
-# ==========================================
-# 4. تشغيل الحسابات ومهام النشر التلقائي (المعدلة)
-# ==========================================
-
-async def run_single_autopost(phone, idx, task):
-    """مهمة واحدة تنام المدة المحددة ثم ترسل"""
-    while True:
-        # التحقق من وجود المهمة ونشاطها
-        acc = DB_STATE["accounts"].get(phone)
-        if not acc:
-            break
-        tasks = acc.get("autopost", [])
-        if idx >= len(tasks):
-            break
-        current_task = tasks[idx]
-        if not current_task.get("active"):
-            break  # توقف إذا أوقفوا المهمة
-
-        interval = current_task.get("interval", 60)
-        await asyncio.sleep(interval * 60)  # ننام المدة المحددة
-
-        # نعيد قراءة البيانات للتحديث
-        acc = DB_STATE["accounts"].get(phone)
-        if not acc:
-            break
-        tasks = acc.get("autopost", [])
-        if idx >= len(tasks):
-            break
-        current_task = tasks[idx]
-        if not current_task.get("active"):
-            break
-
-        client = RUNNING_CLIENTS.get(phone)
-        if not client:
-            continue
-
-        targets = current_task.get("targets", [])
-        msg = current_task.get("msg")
-        for target in targets:
-            try:
-                await client.send_message(target, msg)
-                await asyncio.sleep(random.randint(5, 15))
-            except Exception as e:
-                print(f"⚠️ فشل نشر {phone} إلى {target}: {e}")
-                await asyncio.sleep(10)
-        # تحديث last_sent
-        if phone in DB_STATE["accounts"] and idx < len(DB_STATE["accounts"][phone]["autopost"]):
-            DB_STATE["accounts"][phone]["autopost"][idx]["last_sent"] = time.time()
-            asyncio.create_task(save_to_channel())
-
-async def autopost_worker():
-    """تشغيل مهمة مستقلة لكل رسالة نشر تلقائي نشطة"""
-    while True:
-        for phone, info in list(DB_STATE["accounts"].items()):
-            tasks = info.get("autopost", [])
-            for idx, task in enumerate(tasks):
-                if task.get("active"):
-                    # نبدأ مهمة خلفية لكل رسالة نشطة (إذا لم تبدأ مسبقاً)
-                    # هنا نستخدم متغير عام لتتبع المهام الجارية، لكن للتبسيط نبدأها كل دورة مع شرط عدم التكرار.
-                    # الطريقة الأفضل: تخزين معرفات المهام، ولكن سنكتفي ببدء المهمة مرة واحدة عند بدء الحساب.
-                    pass
-        await asyncio.sleep(300)  # نفحص كل 5 دقائق للتأكد من إضافة مهام جديدة
-
-# سنقوم بتشغيل المهام عند بدء الحساب في start_single_client
-
-async def start_single_client(phone, info):
-    try:
-        session = info.get("session")
-        if not session: return
-        client = Client(
-            f"acc_{phone}",
-            session_string=session,
-            in_memory=True,
-            auto_reconnect=True,
-            sleep_threshold=60
-        )
-        client.acc_phone = phone
-        client.add_handler(MessageHandler(
-            handle_private_messages,
-            filters.private & filters.incoming
-        ))
-        client.add_handler(MessageHandler(
-            handle_user_shortcuts,
-            filters.me & filters.text
-        ))
-        await client.start()
-        client.my_id = (await client.get_me()).id
-        RUNNING_CLIENTS[phone] = client
-        print(f"✅ الحساب {phone} متصل وجاهز.")
-
-        # تشغيل مهام النشر التلقائي لكل مهمة نشطة
-        tasks = info.get("autopost", [])
-        for idx, task in enumerate(tasks):
-            if task.get("active"):
-                asyncio.create_task(run_single_autopost(phone, idx, task))
-    except (AuthKeyUnregistered, SessionRevoked):
-        print(f"⚠️ الجلسة منتهية للحساب {phone}، سيتم حذفه تلقائياً.")
-        DB_STATE["accounts"].pop(phone, None)
-        await save_to_channel()
-    except Exception as e:
-        print(f"❌ فشل تشغيل {phone}: {e}")
 
 async def start_active_sessions():
     for phone, info in list(DB_STATE["accounts"].items()):
         if phone not in RUNNING_CLIENTS:
-            await start_single_client(phone, info)
+            session = info.get("session")
+            client = Client(f"acc_{phone}", session_string=session, in_memory=True)
+            client.acc_phone = phone
+            
+            client.add_handler(MessageHandler(handle_private_messages, filters.private & filters.incoming))
+            client.add_handler(MessageHandler(handle_user_shortcuts, filters.me & filters.text))
+            
+            try:
+                await client.start()
+                client.my_id = (await client.get_me()).id 
+                RUNNING_CLIENTS[phone] = client
+                print(f"✅ الحساب {phone} متصل وجاهز.")
+            except (AuthKeyUnregistered, SessionRevoked):
+                print(f"⚠️ الجلسة منتهية للحساب {phone}، سيتم حذفه تلقائياً.")
+                DB_STATE["accounts"].pop(phone, None)
+                await save_to_channel()
+            except Exception as e:
+                print(f"❌ فشل تشغيل {phone}: {e}")
+
+async def autopost_loop():
+    while True:
+        await asyncio.sleep(30) 
+        current_time = time.time()
+        db_changed = False
+        
+        for phone, info in list(DB_STATE["accounts"].items()):
+            tasks = info.get("autopost", [])
+            client = RUNNING_CLIENTS.get(phone)
+            if not client: continue
+            
+            for task in tasks:
+                if task.get("active"):
+                    interval_sec = task.get("interval", 60) * 60
+                    last_sent = task.get("last_sent", 0)
+                    if (current_time - last_sent) >= interval_sec:
+                        msg_text = task.get("msg")
+                        targets = task.get("targets", [])
+                        for target in targets:
+                            try:
+                                await client.send_message(target, msg_text)
+                                await asyncio.sleep(random.randint(10, 25)) 
+                            except (AuthKeyUnregistered, SessionRevoked):
+                                RUNNING_CLIENTS.pop(phone, None)
+                                DB_STATE["accounts"].pop(phone, None)
+                                db_changed = True
+                                break
+                            except: pass
+                        if phone in DB_STATE["accounts"]:
+                            task["last_sent"] = time.time() 
+                            db_changed = True
+        if db_changed:
+            await save_to_channel()
 
 # ==========================================
-# 5. لوحة التحكم والإدارة (بدون تغيير)
+# 4. لوحة التحكم والإدارة
 # ==========================================
 @bot.message_handler(commands=['format_db'])
 async def format_db_cmd(message):
+    """فرمتة قاعدة البيانات وتسجيل الخروج الشامل"""
     if message.chat.id == PRIMARY_ADMIN_ID:
         global DB_STATE, DB_MESSAGE_ID
-        await bot.reply_to(message, "⏳ جاري مسح القاعدة وتسجيل الخروج...")
+        
+        await bot.reply_to(message, "⏳ جاري مسح القاعدة وتسجيل الخروج من كل الحسابات...")
+        
+        # تسجيل الخروج الفعلي (Log Out) لجميع الحسابات لإنهاء الجلسات في تليجرام
         for phone, client in list(RUNNING_CLIENTS.items()):
             try: await client.log_out()
             except: 
                 try: await client.stop()
                 except: pass
+                
         RUNNING_CLIENTS.clear()
         DB_STATE = {"admins": [PRIMARY_ADMIN_ID], "accounts": {}}
+        
         try:
             chat = await bot.get_chat(DB_CHANNEL_ID)
             if chat.pinned_message:
                 await bot.delete_message(DB_CHANNEL_ID, chat.pinned_message.message_id)
         except: pass
+        
         DB_MESSAGE_ID = None
         await save_to_channel(create_new=True)
-        await bot.reply_to(message, "🗑 تمت فرمتة القاعدة وتسجيل الخروج من جميع الحسابات.")
+        await bot.reply_to(message, "🗑 **تمت فرمتة قاعدة البيانات وتسجيل الخروج من جميع الحسابات بنجاح.**", parse_mode="Markdown")
 
 @bot.message_handler(commands=['start'])
 async def start_cmd(message):
@@ -432,6 +367,7 @@ async def callbacks(call):
 
     elif data.startswith("panel_"):
         phone = data.split("_")[1]
+        
         client = RUNNING_CLIENTS.get(phone)
         if client:
             try:
@@ -447,6 +383,7 @@ async def callbacks(call):
             except Exception: pass
         
         acc_info = DB_STATE["accounts"].get(phone, {})
+        
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
         storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
@@ -509,7 +446,7 @@ async def callbacks(call):
         call.data = f"panel_{phone}"
         await callbacks(call)
 
-    # --- إدارة الاستثناءات ---
+    # --- إدارة الاستثناءات (قوائم) ---
     elif data.startswith("exceptions_"):
         phone = data.split("_")[1]
         markup = InlineKeyboardMarkup()
@@ -539,9 +476,12 @@ async def callbacks(call):
         phone = parts[1]
         exc_type = parts[2]
         target = parts[3]
+        
         if target in DB_STATE["accounts"][phone]["exceptions"][exc_type]:
             DB_STATE["accounts"][phone]["exceptions"][exc_type].remove(target)
             await save_to_channel()
+            
+        call.data = f"exc_menu_bot_{phone}_{exc_type}" 
         call.data = f"exc_menu_{phone}_{exc_type}"
         await callbacks(call)
 
@@ -598,7 +538,7 @@ async def callbacks(call):
         await bot.send_message(user_id, "💬 **أرسل النص الذي تريده للرد التلقائي:**\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
 
-    # --- إدارة النشر التلقائي ---
+    # --- إدارة النشر التلقائي واختيار القروبات ---
     elif data.startswith("autopost_"):
         phone = data.split("_")[1]
         tasks = DB_STATE["accounts"][phone].get("autopost", [])
@@ -624,9 +564,6 @@ async def callbacks(call):
         current = DB_STATE["accounts"][phone]["autopost"][idx]["active"]
         DB_STATE["accounts"][phone]["autopost"][idx]["active"] = not current
         await save_to_channel()
-        # إذا أصبحت نشطة، نبدأ المهمة
-        if DB_STATE["accounts"][phone]["autopost"][idx]["active"]:
-            asyncio.create_task(run_single_autopost(phone, idx, DB_STATE["accounts"][phone]["autopost"][idx]))
         call.data = f"autopost_{phone}"
         await callbacks(call)
 
@@ -644,7 +581,7 @@ async def callbacks(call):
         await bot.send_message(user_id, "✍️ **أرسل الآن الرسالة (النص) التي تريد نشرها:**\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
 
-    # --- واجهة اختيار القروبات ---
+    # --- واجهة اختيار وتحديد القروبات ---
     elif data.startswith("edittgts_"):
         parts = data.split("_")
         phone = parts[1]
@@ -735,19 +672,21 @@ async def callbacks(call):
         
     elif data.startswith("delete_"):
         phone = data.split("_")[1]
+        
         client = RUNNING_CLIENTS.get(phone)
         if client:
-            try: await client.log_out()
+            try: await client.log_out() # تسجيل خروج فعلي من الجلسة
             except: 
                 try: await client.stop()
                 except: pass
             RUNNING_CLIENTS.pop(phone, None)
+            
         DB_STATE["accounts"].pop(phone, None)
         await save_to_channel()
         await bot.answer_callback_query(call.id, "✅ تم الحذف وتسجيل الخروج بنجاح.", show_alert=True)
         await bot.edit_message_text("✅ تم الحذف وتسجيل الخروج من الحساب بنجاح.", chat_id=user_id, message_id=call.message.message_id)
 
-    # --- إدارة الإدمنية ---
+    # --- إدارة الإدمنية للمدير الأساسي ---
     elif data == "manage_admins" and user_id == PRIMARY_ADMIN_ID:
         markup = InlineKeyboardMarkup()
         for ad_id in DB_STATE["admins"]:
@@ -773,9 +712,6 @@ async def callbacks(call):
     elif data == "back_main":
         await start_cmd(call.message)
 
-# ==========================================
-# 6. معالج الرسائل النصية (State machine)
-# ==========================================
 @bot.message_handler(content_types=['text', 'photo', 'video', 'voice', 'document', 'audio', 'video_note'])
 async def handle_inputs(message):
     user_id = message.chat.id
@@ -797,12 +733,15 @@ async def handle_inputs(message):
         phone = state["phone"]
         exc_type = state["exc_type"]
         target = message.text.strip().lower()
+        
         if not target.startswith("@") and not target.isdigit():
             target = f"@{target}"
         target_str = str(target)
+            
         if target_str not in DB_STATE["accounts"][phone]["exceptions"][exc_type]:
             DB_STATE["accounts"][phone]["exceptions"][exc_type].append(target_str)
             await save_to_channel()
+            
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🔙 رجوع للقائمة", callback_data=f"exc_menu_{phone}_{exc_type}"))
             await bot.reply_to(message, f"✅ تم إضافة `{target_str}` إلى قائمة الاستثناءات بنجاح!", reply_markup=markup, parse_mode="Markdown")
@@ -826,6 +765,7 @@ async def handle_inputs(message):
             DB_STATE["accounts"][phone]["shortcuts"][kw] = {"type": "text", "text": message.text}
             await save_to_channel()
             user_states.pop(user_id, None)
+            
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🔙 رجوع للاختصارات", callback_data=f"shortcuts_{phone}"))
             await bot.reply_to(message, f"✅ تم حفظ الاختصار النصي للكلمة: `{kw}`", reply_markup=markup, parse_mode="Markdown")
@@ -833,19 +773,22 @@ async def handle_inputs(message):
             if not client:
                 await bot.reply_to(message, "❌ الحساب غير متصل حالياً لحفظ الميديا.")
                 return
+            
             await bot.reply_to(message, "⏳ جاري الرفع إلى مجموعة التخزين كقاعدة بيانات، يرجى الانتظار...")
             path = await download_telebot_media(message)
             if path:
                 try:
                     caption = message.caption or ""
                     storage_chat_id = DB_STATE["accounts"][phone].get("storage_chat_id")
+                    
                     if storage_chat_id:
                         storage_link = DB_STATE["accounts"][phone].get("storage_chat_link")
                         if storage_link:
                             try: await client.join_chat(storage_link)
                             except: pass
                     else:
-                        storage_chat_id = "me"
+                        storage_chat_id = "me" 
+
                     if message.photo: msg_s = await client.send_photo(int(storage_chat_id) if str(storage_chat_id).lstrip('-').isdigit() else storage_chat_id, path, caption=caption)
                     elif message.video: msg_s = await client.send_video(int(storage_chat_id) if str(storage_chat_id).lstrip('-').isdigit() else storage_chat_id, path, caption=caption)
                     elif message.voice: msg_s = await client.send_voice(int(storage_chat_id) if str(storage_chat_id).lstrip('-').isdigit() else storage_chat_id, path, caption=caption)
@@ -856,6 +799,7 @@ async def handle_inputs(message):
                     DB_STATE["accounts"][phone]["shortcuts"][kw] = {"type": "media", "msg_id": msg_s.id, "chat_id": storage_chat_id}
                     await save_to_channel()
                     user_states.pop(user_id, None)
+                    
                     markup = InlineKeyboardMarkup()
                     markup.add(InlineKeyboardButton("🔙 رجوع للاختصارات", callback_data=f"shortcuts_{phone}"))
                     await bot.reply_to(message, f"✅ تم حفظ اختصار الميديا للكلمة: `{kw}`", reply_markup=markup, parse_mode="Markdown")
@@ -867,7 +811,7 @@ async def handle_inputs(message):
             else:
                 await bot.reply_to(message, "❌ نوع الملف غير مدعوم.")
 
-    # --- تسجيل الدخول ---
+    # [تسجيل الدخول و إنشاء مجموعة التخزين]
     elif step == "phone":
         phone = message.text.strip().replace(" ", "")
         client = Client(f"temp_{phone}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
@@ -888,6 +832,7 @@ async def handle_inputs(message):
         try:
             await client.sign_in(phone, state["phone_code_hash"], code)
             session = await client.export_session_string()
+            
             storage_chat_id, storage_link = await create_storage_group(client)
             DB_STATE["accounts"][phone] = {
                 "session": session, "owner_id": user_id, "auto_save": False, 
@@ -897,7 +842,7 @@ async def handle_inputs(message):
             }
             await save_to_channel()
             await client.disconnect()
-            await start_single_client(phone, DB_STATE["accounts"][phone])  # تشغيل الحساب مباشرة
+            await start_active_sessions()
             user_states.pop(user_id, None)
             msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
             msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يرجى إنشائها من الإعدادات."
@@ -914,6 +859,7 @@ async def handle_inputs(message):
         try:
             await client.check_password(message.text.strip())
             session = await client.export_session_string()
+            
             storage_chat_id, storage_link = await create_storage_group(client)
             DB_STATE["accounts"][phone] = {
                 "session": session, "owner_id": user_id, "auto_save": False, 
@@ -923,7 +869,7 @@ async def handle_inputs(message):
             }
             await save_to_channel()
             await client.disconnect()
-            await start_single_client(phone, DB_STATE["accounts"][phone])
+            await start_active_sessions()
             user_states.pop(user_id, None)
             msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
             msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يرجى إنشائها من الإعدادات."
@@ -931,7 +877,7 @@ async def handle_inputs(message):
         except Exception as e:
             await bot.reply_to(message, f"❌ كلمة المرور خطأ: {e}")
 
-    # --- إعدادات الرد التلقائي ---
+    # [إعدادات الرد التلقائي]
     elif step == "autoreply_msg":
         user_states[user_id]["reply_msg"] = message.text
         user_states[user_id]["step"] = "autoreply_cooldown"
@@ -945,13 +891,14 @@ async def handle_inputs(message):
             DB_STATE["accounts"][phone]["auto_reply"]["cooldown_hours"] = hours
             await save_to_channel()
             user_states.pop(user_id, None)
+            
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
             await bot.reply_to(message, "✅ **تم حفظ إعدادات الرد التلقائي بنجاح!**", reply_markup=markup, parse_mode="Markdown")
         except:
             await bot.reply_to(message, "❌ يرجى إرسال رقم الساعات فقط (مثال: `5`).")
 
-    # --- إعدادات النشر التلقائي ---
+    # [إعدادات النشر التلقائي]
     elif step == "post_msg":
         user_states[user_id]["msg"] = message.text
         user_states[user_id]["step"] = "post_interval"
@@ -969,13 +916,14 @@ async def handle_inputs(message):
             await save_to_channel()
             task_idx = len(DB_STATE["accounts"][phone]["autopost"]) - 1
             user_states.pop(user_id, None)
+            
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🎯 تحديد القروبات للنشر", callback_data=f"edittgts_{phone}_{task_idx}_0"))
             await bot.reply_to(message, "✅ **تم إنشاء المهمة بنجاح!**\nالرجاء الضغط على الزر أدناه لتحديد القروبات التي سينشر بها:", reply_markup=markup, parse_mode="Markdown")
         except:
             await bot.reply_to(message, "❌ يرجى إرسال أرقام فقط للدقائق.")
 
-    # --- بقية الأوامر ---
+    # [بقية الأوامر الفورية]
     elif step == "wait_bio":
         phone = state["phone"]
         if phone in RUNNING_CLIENTS:
@@ -988,6 +936,7 @@ async def handle_inputs(message):
         link = message.text.strip()
         if "t.me/+" not in link and "joinchat" not in link:
             link = f"@{link.split('t.me/')[-1].split('/')[0].split('?')[0]}" if "t.me/" in link else f"@{link.replace('@', '')}"
+        
         if phone in RUNNING_CLIENTS:
             try:
                 await RUNNING_CLIENTS[phone].join_chat(link)
@@ -1008,31 +957,17 @@ async def handle_inputs(message):
         user_states.pop(user_id, None)
 
 # ==========================================
-# 7. دوال التشغيل
+# 5. دوال التشغيل والمزامنة
 # ==========================================
 async def start_bot():
     await bot.delete_webhook(drop_pending_updates=True)
     await sync_from_channel()
     await start_active_sessions()
-    asyncio.create_task(autopost_worker())  # مهمة خفيفة للتحقق الدوري (غير ضرورية)
-    print("🚀 Shadow Userbot Agency v3 (optimized) is running on Render!")
-    while True:
-        try:
-            await bot.polling(non_stop=True, timeout=60)
-        except Exception as e:
-            print(f"🔥 Polling crash: {e}. Restart in 5s...")
-            await asyncio.sleep(5)
+    asyncio.create_task(autopost_loop())
+    print("Bot 2 (Advanced Userbot Agency) is running actively...")
+    await bot.polling(non_stop=True)
 
 def run():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(start_bot())
-    except KeyboardInterrupt:
-        print("🛑 Stopped.")
-    finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-
-if __name__ == "__main__":
-    run()
+    loop.run_until_complete(start_bot())
