@@ -8,7 +8,7 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered, SessionRevoked
 from pyrogram.enums import ChatType
 
 # ==========================================
@@ -26,7 +26,7 @@ RUNNING_CLIENTS = {}
 LAST_REPLY_TIME = {}
 
 # ==========================================
-# 2. نظام قاعدة البيانات السحابية
+# 2. نظام قاعدة البيانات السحابية الحية
 # ==========================================
 DB_STATE = {
     "admins": [PRIMARY_ADMIN_ID],
@@ -97,7 +97,7 @@ async def save_to_channel(create_new=False):
             msg = await bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
             DB_MESSAGE_ID = msg.message_id
             await bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
-    except Exception as e:
+    except Exception:
         pass
 
 # ==========================================
@@ -110,12 +110,10 @@ async def fetch_account_groups(client):
         async for d in client.get_dialogs(limit=200):
             if d.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
                 groups.append({"id": d.chat.id, "title": d.chat.title})
-    except Exception as e:
-        pass
+    except: pass
     return groups
 
 async def create_storage_group(client):
-    """الآن ننشئ المجموعة ونصدر رابطها لحل مشكلة الذاكرة"""
     try:
         chat = await client.create_supergroup("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص وحفظ الميديا هنا تلقائياً")
         link = chat.invite_link or await chat.export_invite_link()
@@ -125,8 +123,7 @@ async def create_storage_group(client):
             chat = await client.create_channel("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص وحفظ الميديا هنا تلقائياً")
             link = chat.invite_link or await chat.export_invite_link()
             return chat.id, link
-        except:
-            return None, None
+        except: return None, None
 
 async def download_telebot_media(message):
     file_id = None
@@ -165,7 +162,6 @@ async def handle_user_shortcuts(client, message):
                 chat_id = shortcut.get("chat_id", "me")
                 chat_id = int(chat_id) if str(chat_id).lstrip('-').isdigit() else chat_id
                 
-                # تنشيط الذاكرة للرابط إن وجد
                 storage_link = DB_STATE["accounts"].get(phone, {}).get("storage_chat_link")
                 if storage_link:
                     try: await client.join_chat(storage_link)
@@ -186,7 +182,6 @@ async def handle_private_messages(client, message):
 
     user_id_str = str(user.id)
     username = f"@{user.username.lower()}" if user.username else ""
-    
     exceptions = acc_info.get("exceptions", {"storage": [], "autoreply": []})
     
     is_storage_exc = False
@@ -220,13 +215,11 @@ async def handle_private_messages(client, message):
                 os.remove(path)
         except: pass
 
-    # تحويل رسائل الخاص العادية إلى مجموعة التخزين
     storage_id = acc_info.get("storage_chat_id")
     if storage_id and not is_ttl and not is_storage_exc:
         try:
             await message.forward(int(storage_id))
-        except Exception as e:
-            # محاولة إنعاش الذاكرة إذا فشل التحويل
+        except:
             link = acc_info.get("storage_chat_link")
             if link:
                 try: 
@@ -234,7 +227,6 @@ async def handle_private_messages(client, message):
                     await message.forward(int(storage_id))
                 except: pass
 
-    # الرد التلقائي
     auto_reply = acc_info.get("auto_reply", {})
     if auto_reply.get("active") and auto_reply.get("msg") and not is_reply_exc and not is_ttl:
         cooldown_sec = auto_reply.get("cooldown_hours", 3) * 3600
@@ -250,7 +242,7 @@ async def handle_private_messages(client, message):
             except: pass
 
 async def start_active_sessions():
-    for phone, info in DB_STATE["accounts"].items():
+    for phone, info in list(DB_STATE["accounts"].items()):
         if phone not in RUNNING_CLIENTS:
             session = info.get("session")
             client = Client(f"acc_{phone}", session_string=session, in_memory=True)
@@ -262,19 +254,12 @@ async def start_active_sessions():
             try:
                 await client.start()
                 client.my_id = (await client.get_me()).id 
-                
-                # 🟢 تنشيط ذاكرة الحساب لمجموعة التخزين بعد إعادة التشغيل
-                storage_link = info.get("storage_chat_link")
-                if storage_link:
-                    try: await client.join_chat(storage_link)
-                    except: pass
-                else:
-                    try:
-                        async for _ in client.get_dialogs(limit=50): pass
-                    except: pass
-                    
                 RUNNING_CLIENTS[phone] = client
                 print(f"✅ الحساب {phone} متصل وجاهز.")
+            except (AuthKeyUnregistered, SessionRevoked):
+                print(f"⚠️ الجلسة منتهية للحساب {phone}، سيتم حذفه تلقائياً.")
+                DB_STATE["accounts"].pop(phone, None)
+                await save_to_channel()
             except Exception as e:
                 print(f"❌ فشل تشغيل {phone}: {e}")
 
@@ -284,7 +269,7 @@ async def autopost_loop():
         current_time = time.time()
         db_changed = False
         
-        for phone, info in DB_STATE["accounts"].items():
+        for phone, info in list(DB_STATE["accounts"].items()):
             tasks = info.get("autopost", [])
             client = RUNNING_CLIENTS.get(phone)
             if not client: continue
@@ -300,15 +285,49 @@ async def autopost_loop():
                             try:
                                 await client.send_message(target, msg_text)
                                 await asyncio.sleep(random.randint(10, 25)) 
+                            except (AuthKeyUnregistered, SessionRevoked):
+                                RUNNING_CLIENTS.pop(phone, None)
+                                DB_STATE["accounts"].pop(phone, None)
+                                db_changed = True
+                                break
                             except: pass
-                        task["last_sent"] = time.time() 
-                        db_changed = True
+                        if phone in DB_STATE["accounts"]:
+                            task["last_sent"] = time.time() 
+                            db_changed = True
         if db_changed:
             await save_to_channel()
 
 # ==========================================
 # 4. لوحة التحكم والإدارة
 # ==========================================
+@bot.message_handler(commands=['format_db'])
+async def format_db_cmd(message):
+    """فرمتة قاعدة البيانات وتسجيل الخروج الشامل"""
+    if message.chat.id == PRIMARY_ADMIN_ID:
+        global DB_STATE, DB_MESSAGE_ID
+        
+        await bot.reply_to(message, "⏳ جاري مسح القاعدة وتسجيل الخروج من كل الحسابات...")
+        
+        # تسجيل الخروج الفعلي (Log Out) لجميع الحسابات لإنهاء الجلسات في تليجرام
+        for phone, client in list(RUNNING_CLIENTS.items()):
+            try: await client.log_out()
+            except: 
+                try: await client.stop()
+                except: pass
+                
+        RUNNING_CLIENTS.clear()
+        DB_STATE = {"admins": [PRIMARY_ADMIN_ID], "accounts": {}}
+        
+        try:
+            chat = await bot.get_chat(DB_CHANNEL_ID)
+            if chat.pinned_message:
+                await bot.delete_message(DB_CHANNEL_ID, chat.pinned_message.message_id)
+        except: pass
+        
+        DB_MESSAGE_ID = None
+        await save_to_channel(create_new=True)
+        await bot.reply_to(message, "🗑 **تمت فرمتة قاعدة البيانات وتسجيل الخروج من جميع الحسابات بنجاح.**", parse_mode="Markdown")
+
 @bot.message_handler(commands=['start'])
 async def start_cmd(message):
     user_id = message.chat.id
@@ -348,6 +367,21 @@ async def callbacks(call):
 
     elif data.startswith("panel_"):
         phone = data.split("_")[1]
+        
+        client = RUNNING_CLIENTS.get(phone)
+        if client:
+            try:
+                await client.get_me()
+            except (AuthKeyUnregistered, SessionRevoked):
+                DB_STATE["accounts"].pop(phone, None)
+                RUNNING_CLIENTS.pop(phone, None)
+                await save_to_channel()
+                await bot.answer_callback_query(call.id, "❌ تم تسجيل الخروج من هذا الحساب من مكان آخر! تم حذفه من النظام.", show_alert=True)
+                call.data = "my_accounts"
+                await callbacks(call)
+                return
+            except Exception: pass
+        
         acc_info = DB_STATE["accounts"].get(phone, {})
         
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
@@ -360,7 +394,7 @@ async def callbacks(call):
         markup.add(InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"), InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"))
         markup.add(InlineKeyboardButton("🛡 إدارة الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
         markup.add(InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"), InlineKeyboardButton("✍️ النبذة", callback_data=f"bio_{phone}"))
-        markup.add(InlineKeyboardButton("🗑 حذف الحساب", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
+        markup.add(InlineKeyboardButton("🗑 حذف وتسجيل خروج", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
         
         await bot.edit_message_text(f"⚙️ **تحكم حساب: `{phone}`**\nيمكنك التحكم بكافة خصائص الحساب من هنا.", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -382,20 +416,17 @@ async def callbacks(call):
                 else:
                     async for _ in client.get_dialogs(limit=100): pass
                     
-                chat = await client.get_chat(int(storage_id))
-                
-                # تأكيد حفظ الرابط إن لم يكن موجوداً
+                await client.get_chat(int(storage_id))
                 if not storage_link:
                     try:
-                        link = chat.invite_link or await chat.export_invite_link()
+                        link = (await client.get_chat(int(storage_id))).invite_link or await (await client.get_chat(int(storage_id))).export_invite_link()
                         DB_STATE["accounts"][phone]["storage_chat_link"] = link
                         await save_to_channel()
                     except: pass
                     
                 await bot.answer_callback_query(call.id, "✅ مجموعة التخزين موجودة ومسجلة في القاعدة وتعمل بشكل سليم!", show_alert=True)
                 return
-            except Exception as e:
-                pass 
+            except Exception: pass 
 
         await bot.answer_callback_query(call.id, "⏳ جاري إنشاء المجموعة...")
         storage_id, link = await create_storage_group(client)
@@ -405,7 +436,7 @@ async def callbacks(call):
             await save_to_channel()
             await bot.send_message(user_id, f"✅ تم إنشاء مجموعة التخزين بنجاح وتم حفظ الآيدي بالقاعدة!\n🔗 الرابط: {link}\n*(لا تقم بحذفها)*", parse_mode="Markdown")
         else:
-            await bot.send_message(user_id, "❌ فشل إنشاء مجموعة التخزين (قد يكون الحساب محظور من إنشاء مجموعات).")
+            await bot.send_message(user_id, "❌ فشل إنشاء مجموعة التخزين.")
 
     elif data.startswith("autosave_"):
         phone = data.split("_")[1]
@@ -641,13 +672,19 @@ async def callbacks(call):
         
     elif data.startswith("delete_"):
         phone = data.split("_")[1]
-        DB_STATE["accounts"].pop(phone, None)
-        if phone in RUNNING_CLIENTS:
-            await RUNNING_CLIENTS[phone].stop()
+        
+        client = RUNNING_CLIENTS.get(phone)
+        if client:
+            try: await client.log_out() # تسجيل خروج فعلي من الجلسة
+            except: 
+                try: await client.stop()
+                except: pass
             RUNNING_CLIENTS.pop(phone, None)
+            
+        DB_STATE["accounts"].pop(phone, None)
         await save_to_channel()
-        await bot.answer_callback_query(call.id, "✅ تم الحذف.", show_alert=True)
-        await bot.edit_message_text("✅ تم الحذف بنجاح.", chat_id=user_id, message_id=call.message.message_id)
+        await bot.answer_callback_query(call.id, "✅ تم الحذف وتسجيل الخروج بنجاح.", show_alert=True)
+        await bot.edit_message_text("✅ تم الحذف وتسجيل الخروج من الحساب بنجاح.", chat_id=user_id, message_id=call.message.message_id)
 
     # --- إدارة الإدمنية للمدير الأساسي ---
     elif data == "manage_admins" and user_id == PRIMARY_ADMIN_ID:
