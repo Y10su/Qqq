@@ -9,6 +9,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered
+from pyrogram.enums import ChatType
 
 # ==========================================
 # 1. إعدادات اليوزر بوت
@@ -22,7 +23,7 @@ DB_CHANNEL_ID = -1004352728061
 bot = AsyncTeleBot(BOT_TOKEN)
 user_states = {}
 RUNNING_CLIENTS = {}
-LAST_REPLY_TIME = {} # تتبع وقت آخر رد تلقائي { "phone": { "user_id": timestamp } }
+LAST_REPLY_TIME = {}
 
 # ==========================================
 # 2. نظام قاعدة البيانات السحابية
@@ -50,12 +51,13 @@ async def sync_from_channel():
                         accounts = data.get("accounts", {})
                         for phone, info in accounts.items():
                             if isinstance(info, str):
-                                accounts[phone] = {"session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False, "autopost": [], "storage_chat_id": None, "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}}
+                                accounts[phone] = {"session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False, "autopost": [], "storage_chat_id": None, "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}, "cached_groups": []}
                             else:
                                 if "auto_save" not in info: info["auto_save"] = False
                                 if "autopost" not in info or isinstance(info["autopost"], dict): info["autopost"] = []
                                 if "storage_chat_id" not in info: info["storage_chat_id"] = None
                                 if "auto_reply" not in info: info["auto_reply"] = {"active": False, "msg": "", "cooldown_hours": 3}
+                                if "cached_groups" not in info: info["cached_groups"] = []
                         DB_STATE["accounts"] = accounts
                         print(f"✅ تم استرجاع {len(DB_STATE['accounts'])} حساب محفوظ.")
                         return
@@ -91,6 +93,29 @@ async def save_to_channel(create_new=False):
 # ==========================================
 # 3. أنظمة اليوزر بوت الآلية المستمرة
 # ==========================================
+async def fetch_account_groups(client):
+    """جلب قائمة القروبات التي ينتمي إليها الحساب"""
+    groups = []
+    try:
+        async for d in client.get_dialogs(limit=200):
+            if d.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+                groups.append({"id": d.chat.id, "title": d.chat.title})
+    except Exception as e:
+        print(f"Error fetching groups: {e}")
+    return groups
+
+async def create_storage_group(client):
+    """إنشاء قروب التخزين بشكل آمن"""
+    try:
+        chat = await client.create_supergroup("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص هنا تلقائياً")
+        return chat.id
+    except:
+        try:
+            chat = await client.create_channel("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص هنا تلقائياً")
+            return chat.id
+        except:
+            return None
+
 async def handle_private_messages(client, message):
     """معالج رئيسي لرسائل الخاص (ذاتية + تحويل للمجموعة + رد تلقائي)"""
     phone = getattr(client, "acc_phone", None)
@@ -124,7 +149,6 @@ async def handle_private_messages(client, message):
     storage_id = acc_info.get("storage_chat_id")
     if storage_id and not is_ttl:
         try:
-            # تحويل الرسالة لقناة التخزين الخاصة
             await message.forward(storage_id)
         except Exception as e:
             pass
@@ -135,31 +159,25 @@ async def handle_private_messages(client, message):
         user_id = message.from_user.id
         cooldown_sec = auto_reply.get("cooldown_hours", 3) * 3600
         
-        # التأكد من إنشاء القاموس للحساب إذا لم يكن موجوداً
         if phone not in LAST_REPLY_TIME: LAST_REPLY_TIME[phone] = {}
         
         last_time = LAST_REPLY_TIME[phone].get(user_id, 0)
         current_time = time.time()
         
-        # إذا مرت المدة المحددة (أو كانت أول مرة يرسل فيها)
         if (current_time - last_time) >= cooldown_sec:
             try:
                 await client.send_message(user_id, auto_reply["msg"])
-                LAST_REPLY_TIME[phone][user_id] = current_time # تحديث الوقت
+                LAST_REPLY_TIME[phone][user_id] = current_time 
             except Exception:
                 pass
 
 async def start_active_sessions():
-    """تشغيل جميع الحسابات في الخلفية مع ربط المعالج الشامل"""
     for phone, info in DB_STATE["accounts"].items():
         if phone not in RUNNING_CLIENTS:
             session = info.get("session")
             client = Client(f"acc_{phone}", session_string=session, in_memory=True)
             client.acc_phone = phone
-            
-            # معالج واحد شامل لجميع رسائل الخاص (واردة فقط)
             client.add_handler(MessageHandler(handle_private_messages, filters.private & filters.incoming))
-            
             try:
                 await client.start()
                 RUNNING_CLIENTS[phone] = client
@@ -168,7 +186,6 @@ async def start_active_sessions():
                 print(f"❌ فشل تشغيل {phone}: {e}")
 
 async def autopost_loop():
-    """مؤقت زمني للنشر التلقائي مع حماية من الباند"""
     while True:
         await asyncio.sleep(30) 
         current_time = time.time()
@@ -191,12 +208,12 @@ async def autopost_loop():
                         for target in targets:
                             try:
                                 await client.send_message(target, msg_text)
-                                # تأخير عشوائي بين 10 إلى 25 ثانية بين كل قروب وقروب لتفادي حظر السبام!
+                                # تأخير عشوائي بين القروبات للحماية من الباند
                                 await asyncio.sleep(random.randint(10, 25)) 
                             except Exception as e:
-                                print(f"⚠️ خطأ النشر لـ {target} (حساب {phone}): {e}")
+                                pass
                         
-                        task["last_sent"] = time.time() # تحديث الوقت بعد انتهاء النشر
+                        task["last_sent"] = time.time() 
                         db_changed = True
                         
         if db_changed:
@@ -248,16 +265,34 @@ async def callbacks(call):
         
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
+        storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
         
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton(f"📥 صيد الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
+        markup.add(InlineKeyboardButton(f"📥 حفظ الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
         markup.add(InlineKeyboardButton(f"🔄 إدارة مهام النشر التلقائي", callback_data=f"autopost_{phone}"))
-        markup.add(InlineKeyboardButton(f"💬 الرد التلقائي بالخاص: {reply_status}", callback_data=f"autoreply_toggle_{phone}"))
+        markup.add(InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"))
         markup.add(InlineKeyboardButton("⚙️ إعدادات الرد التلقائي", callback_data=f"autoreply_setup_{phone}"))
+        markup.add(InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
         markup.add(InlineKeyboardButton("🔗 الانضمام لقناة", callback_data=f"join_{phone}"), InlineKeyboardButton("✍️ النبذة", callback_data=f"bio_{phone}"))
         markup.add(InlineKeyboardButton("🗑 حذف الحساب", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
         
-        await bot.edit_message_text(f"⚙️ **تحكم حساب: `{phone}`**\nيتم تحويل رسائل الخاص تلقائياً إلى مجموعة التخزين.", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        await bot.edit_message_text(f"⚙️ **تحكم حساب: `{phone}`**\nيمكنك التحكم بكافة خصائص الحساب من هنا.", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("fixstorage_"):
+        phone = data.split("_")[1]
+        client = RUNNING_CLIENTS.get(phone)
+        if not client:
+            await bot.answer_callback_query(call.id, "الحساب غير متصل حالياً!", show_alert=True)
+            return
+        await bot.answer_callback_query(call.id, "⏳ جاري إنشاء وربط مجموعة التخزين...")
+        s_id = await create_storage_group(client)
+        if s_id:
+            DB_STATE["accounts"][phone]["storage_chat_id"] = s_id
+            await save_to_channel()
+            call.data = f"panel_{phone}"
+            await callbacks(call)
+        else:
+            await bot.send_message(user_id, "❌ فشل إنشاء مجموعة التخزين (قد يكون الحساب محظور من إنشاء مجموعات).")
 
     # --- إدارة الذاتية ---
     elif data.startswith("autosave_"):
@@ -272,11 +307,9 @@ async def callbacks(call):
     elif data.startswith("autoreply_toggle_"):
         phone = data.split("_")[2]
         current_status = DB_STATE["accounts"][phone]["auto_reply"]["active"]
-        
         if not current_status and not DB_STATE["accounts"][phone]["auto_reply"].get("msg"):
             await bot.answer_callback_query(call.id, "❌ يجب إعداد رسالة الرد أولاً من الإعدادات!", show_alert=True)
             return
-            
         DB_STATE["accounts"][phone]["auto_reply"]["active"] = not current_status
         await save_to_channel()
         call.data = f"panel_{phone}"
@@ -288,7 +321,7 @@ async def callbacks(call):
         await bot.send_message(user_id, "💬 **أرسل النص الذي تريده للرد التلقائي:**", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
 
-    # --- إدارة النشر التلقائي المتعدد ---
+    # --- إدارة النشر التلقائي واختيار القروبات ---
     elif data.startswith("autopost_"):
         phone = data.split("_")[1]
         tasks = DB_STATE["accounts"][phone].get("autopost", [])
@@ -298,12 +331,15 @@ async def callbacks(call):
             status = "✅" if task.get("active") else "❌"
             targets_count = len(task.get("targets", []))
             markup.add(InlineKeyboardButton(f"{status} مهمة {i+1} ({targets_count} قروبات) - كل {task['interval']}د", callback_data=f"togglepost_{phone}_{i}"))
-            markup.add(InlineKeyboardButton(f"🗑 حذف المهمة {i+1}", callback_data=f"delpost_{phone}_{i}"))
+            markup.add(
+                InlineKeyboardButton(f"⚙️ تعديل القروبات", callback_data=f"edittgts_{phone}_{i}_0"),
+                InlineKeyboardButton(f"🗑 حذف", callback_data=f"delpost_{phone}_{i}")
+            )
             
         markup.add(InlineKeyboardButton("➕ إضافة رسالة جديدة للنشر", callback_data=f"newpost_{phone}"))
         markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
         
-        await bot.edit_message_text(f"🔄 **إدارة مهام النشر التلقائي - `{phone}`**\n(يوجد فاصل زمني آمن بين كل قروب لتفادي الحظر):", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        await bot.edit_message_text(f"🔄 **إدارة مهام النشر التلقائي - `{phone}`**\nيمكنك تخصيص القروبات لكل رسالة بشكل مستقل:", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("togglepost_"):
         _, phone, idx = data.split("_")
@@ -324,9 +360,85 @@ async def callbacks(call):
 
     elif data.startswith("newpost_"):
         phone = data.split("_")[1]
-        user_states[user_id] = {"step": "post_targets", "phone": phone}
-        await bot.send_message(user_id, "🎯 **أرسل معرفات القنوات/القروبات:**\nأرسلها مفصولة بمسافة (مثال: `@group1 @group2`):", parse_mode="Markdown")
+        user_states[user_id] = {"step": "post_msg", "phone": phone}
+        await bot.send_message(user_id, "✍️ **أرسل الآن الرسالة (النص) التي تريد نشرها:**", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
+
+    # --- واجهة اختيار وتحديد القروبات ---
+    elif data.startswith("edittgts_"):
+        parts = data.split("_")
+        phone = parts[1]
+        idx = int(parts[2])
+        page = int(parts[3])
+        
+        client = RUNNING_CLIENTS.get(phone)
+        if not client:
+            await bot.answer_callback_query(call.id, "الحساب غير متصل حالياً!", show_alert=True)
+            return
+
+        acc = DB_STATE["accounts"][phone]
+        if not acc.get("cached_groups"):
+            await bot.answer_callback_query(call.id, "⏳ جاري استخراج القروبات، انتظر ثواني...")
+            acc["cached_groups"] = await fetch_account_groups(client)
+            await save_to_channel()
+
+        groups = acc["cached_groups"]
+        task = acc["autopost"][idx]
+        targets = task.get("targets", [])
+
+        PER_PAGE = 10
+        start = page * PER_PAGE
+        end = start + PER_PAGE
+        current_groups = groups[start:end]
+
+        markup = InlineKeyboardMarkup()
+        for g in current_groups:
+            is_selected = g["id"] in targets
+            mark = "✅" if is_selected else "❌"
+            title = g["title"][:30]
+            markup.add(InlineKeyboardButton(f"{mark} {title}", callback_data=f"tgttgl_{phone}_{idx}_{g['id']}_{page}"))
+
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"edittgts_{phone}_{idx}_{page-1}"))
+        if end < len(groups):
+            nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_data=f"edittgts_{phone}_{idx}_{page+1}"))
+        if nav_buttons:
+            markup.add(*nav_buttons)
+
+        markup.add(InlineKeyboardButton("🔄 تحديث قائمة القروبات", callback_data=f"refreshtgts_{phone}_{idx}_{page}"))
+        markup.add(InlineKeyboardButton("✅ حفظ التعديلات", callback_data=f"autopost_{phone}"))
+
+        await bot.edit_message_text(f"🎯 **اختر القروبات للمهمة {idx+1}:**\nاضغط على القروب لتفعيله/إلغائه:", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("tgttgl_"):
+        parts = data.split("_")
+        phone = parts[1]
+        idx = int(parts[2])
+        chat_id = int(parts[3])
+        page = int(parts[4])
+
+        task = DB_STATE["accounts"][phone]["autopost"][idx]
+        if chat_id in task["targets"]:
+            task["targets"].remove(chat_id)
+        else:
+            task["targets"].append(chat_id)
+
+        await save_to_channel()
+        call.data = f"edittgts_{phone}_{idx}_{page}"
+        await callbacks(call)
+
+    elif data.startswith("refreshtgts_"):
+        parts = data.split("_")
+        phone = parts[1]
+        idx = int(parts[2])
+        page = int(parts[3])
+        client = RUNNING_CLIENTS.get(phone)
+        await bot.answer_callback_query(call.id, "⏳ جاري التحديث من سيرفرات تليجرام...")
+        DB_STATE["accounts"][phone]["cached_groups"] = await fetch_account_groups(client)
+        await save_to_channel()
+        call.data = f"edittgts_{phone}_{idx}_{page}"
+        await callbacks(call)
 
     # --- بقية الأوامر ---
     elif data.startswith("bio_"):
@@ -405,24 +517,20 @@ async def handle_inputs(message):
             await client.sign_in(phone, state["phone_code_hash"], code)
             session = await client.export_session_string()
             
-            # 🟢 إنشاء قناة خاصة لحفظ الرسائل (التجسس)
-            storage_chat_id = None
-            try:
-                chat = await client.create_channel("مجموعة التخزين", "يتم تحويل رسائل الخاص هنا تلقائياً")
-                storage_chat_id = chat.id
-            except Exception as e:
-                print(f"Failed to create storage group: {e}")
-
+            storage_chat_id = await create_storage_group(client)
             DB_STATE["accounts"][phone] = {
                 "session": session, "owner_id": user_id, "auto_save": False, 
                 "autopost": [], "storage_chat_id": storage_chat_id,
-                "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}
+                "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
+                "cached_groups": []
             }
             await save_to_channel()
             await client.disconnect()
             await start_active_sessions()
             user_states.pop(user_id, None)
-            await bot.reply_to(message, f"✅ **تم ربط الحساب `{phone}`!**\nتم إنشاء 'مجموعة التخزين' بنجاح في حسابك لاستقبال رسائل الخاص.", parse_mode="Markdown")
+            msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
+            msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يمكنك إنشائها يدوياً من الإعدادات."
+            await bot.reply_to(message, msg_reply, parse_mode="Markdown")
         except SessionPasswordNeeded:
             user_states[user_id]["step"] = "2fa"
             await bot.reply_to(message, "🔐 الحساب محمي (2FA). أرسل كلمة المرور:")
@@ -436,23 +544,20 @@ async def handle_inputs(message):
             await client.check_password(message.text.strip())
             session = await client.export_session_string()
             
-            storage_chat_id = None
-            try:
-                chat = await client.create_channel("مجموعة التخزين", "يتم تحويل رسائل الخاص هنا تلقائياً")
-                storage_chat_id = chat.id
-            except Exception as e:
-                pass
-
+            storage_chat_id = await create_storage_group(client)
             DB_STATE["accounts"][phone] = {
                 "session": session, "owner_id": user_id, "auto_save": False, 
                 "autopost": [], "storage_chat_id": storage_chat_id,
-                "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}
+                "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
+                "cached_groups": []
             }
             await save_to_channel()
             await client.disconnect()
             await start_active_sessions()
             user_states.pop(user_id, None)
-            await bot.reply_to(message, f"✅ **تم ربط الحساب `{phone}`!**\nتم إنشاء 'مجموعة التخزين' بنجاح.", parse_mode="Markdown")
+            msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
+            msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يمكنك إنشائها يدوياً من الإعدادات."
+            await bot.reply_to(message, msg_reply, parse_mode="Markdown")
         except Exception as e:
             await bot.reply_to(message, f"❌ كلمة المرور خطأ: {e}")
 
@@ -460,7 +565,7 @@ async def handle_inputs(message):
     elif step == "autoreply_msg":
         user_states[user_id]["reply_msg"] = message.text
         user_states[user_id]["step"] = "autoreply_cooldown"
-        await bot.reply_to(message, "⏳ **كم ساعة يجب أن تمر حتى يرد البوت على نفس الشخص مرة أخرى؟**\n(أرسل رقم فقط، مثال: `5` يعني لن يرد عليه مرة ثانية إلا بعد 5 ساعات):")
+        await bot.reply_to(message, "⏳ **كم ساعة يجب أن تمر حتى يرد البوت على نفس الشخص مرة أخرى؟**\n(مثال: `5`):")
 
     elif step == "autoreply_cooldown":
         try:
@@ -473,17 +578,11 @@ async def handle_inputs(message):
             
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
-            await bot.reply_to(message, "✅ **تم حفظ إعدادات الرد التلقائي بنجاح!**\nيمكنك الآن تفعيل الميزة من لوحة تحكم الحساب.", reply_markup=markup, parse_mode="Markdown")
+            await bot.reply_to(message, "✅ **تم حفظ إعدادات الرد التلقائي بنجاح!**", reply_markup=markup, parse_mode="Markdown")
         except:
             await bot.reply_to(message, "❌ يرجى إرسال رقم الساعات فقط (مثال: `5`).")
 
-    # [إعدادات النشر التلقائي المتعدد]
-    elif step == "post_targets":
-        targets = [t.strip() for t in re.split(r'[, \n]+', message.text) if t.strip()]
-        user_states[user_id]["targets"] = targets
-        user_states[user_id]["step"] = "post_msg"
-        await bot.reply_to(message, f"🎯 تم حفظ ({len(targets)}) قروبات.\n✍️ أرسل الآن الرسالة (النص) التي تريد نشرها:")
-
+    # [إعدادات النشر التلقائي - سحب القروبات آلياً]
     elif step == "post_msg":
         user_states[user_id]["msg"] = message.text
         user_states[user_id]["step"] = "post_interval"
@@ -494,16 +593,17 @@ async def handle_inputs(message):
             interval = int(message.text.strip())
             phone = state["phone"]
             task = {
-                "active": True, "targets": state["targets"], "msg": state["msg"],
+                "active": False, "targets": [], "msg": state["msg"],
                 "interval": interval, "last_sent": 0
             }
             DB_STATE["accounts"][phone]["autopost"].append(task)
             await save_to_channel()
+            task_idx = len(DB_STATE["accounts"][phone]["autopost"]) - 1
             user_states.pop(user_id, None)
             
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔙 رجوع لإدارة النشر", callback_data=f"autopost_{phone}"))
-            await bot.reply_to(message, "✅ **تم إضافة مهمة النشر بنجاح!**", reply_markup=markup, parse_mode="Markdown")
+            markup.add(InlineKeyboardButton("🎯 تحديد القروبات للنشر", callback_data=f"edittgts_{phone}_{task_idx}_0"))
+            await bot.reply_to(message, "✅ **تم إنشاء المهمة بنجاح!**\nالرجاء الضغط على الزر أدناه لتحديد القروبات التي سينشر بها:", reply_markup=markup, parse_mode="Markdown")
         except:
             await bot.reply_to(message, "❌ يرجى إرسال أرقام فقط للدقائق.")
 
