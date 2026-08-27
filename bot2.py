@@ -25,9 +25,7 @@ bot = AsyncTeleBot(BOT_TOKEN)
 user_states = {}
 RUNNING_CLIENTS = {}
 LAST_REPLY_TIME = {}
-
-# سجل تتبع الرد المستمر النشط
-ACTIVE_RAIDS = {}  # Format: { "phone": { "target_user_id": True/False } }
+ACTIVE_RAIDS = {}
 
 # ==========================================
 # 2. نظام قاعدة البيانات السحابية الحية
@@ -155,13 +153,11 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
     while ACTIVE_RAIDS.get(phone, {}).get(target_user_id):
         for sentence in sentences:
             if not ACTIVE_RAIDS.get(phone, {}).get(target_user_id):
-                break  # خروج فوري إذا تم إيقافه
+                break
             try:
                 await client.send_message(chat_id, sentence, reply_to_message_id=target_msg_id)
-                # تأخير عشوائي للحماية من الحظر
                 await asyncio.sleep(random.uniform(2.0, 3.5)) 
             except Exception as e:
-                # إذا قام الشخص بحذف رسالته، نرسل بدون ريبلاي
                 if "MESSAGE_ID_INVALID" in str(e).upper():
                     try:
                         await client.send_message(chat_id, sentence)
@@ -184,17 +180,13 @@ async def handle_continuous_reply(client, message):
     
     target_user = message.reply_to_message.from_user if message.reply_to_message else None
     if not target_user: return
-    
     target_id = target_user.id
 
-    # تشغيل الرد المستمر
     if text == ".ضرب":
         if not sentences:
             await message.edit_text("❌ لم تقم بإضافة أي جمل للرد المستمر من إعدادات البوت!")
             return
-            
         if phone not in ACTIVE_RAIDS: ACTIVE_RAIDS[phone] = {}
-        
         if ACTIVE_RAIDS[phone].get(target_id):
             await message.edit_text("⚠️ الرد المستمر شغال بالفعل على هذا الشخص!")
             return
@@ -203,7 +195,6 @@ async def handle_continuous_reply(client, message):
         await message.delete() 
         asyncio.create_task(raid_worker(client, phone, message.chat.id, message.reply_to_message.id, target_id, sentences))
 
-    # إيقاف الرد المستمر
     elif text == ".ايقاف":
         if phone in ACTIVE_RAIDS and ACTIVE_RAIDS[phone].get(target_id):
             ACTIVE_RAIDS[phone][target_id] = False
@@ -358,7 +349,6 @@ async def start_single_client(phone, info):
         )
         client.acc_phone = phone
         
-        # توزيع المهام بصلاحيات منفصلة لتجنب التداخل
         client.add_handler(MessageHandler(handle_private_messages, filters.private & filters.incoming), group=1)
         client.add_handler(MessageHandler(handle_user_shortcuts, filters.me & filters.text), group=2)
         client.add_handler(MessageHandler(handle_continuous_reply, filters.me & filters.reply & filters.text), group=3)
@@ -413,27 +403,47 @@ async def start_cmd(message):
     user_id = message.chat.id
     if user_id not in DB_STATE["admins"]: return
 
+    owned = sum(1 for acc in DB_STATE["accounts"].values() if acc["owner_id"] == user_id)
+    
+    # تنسيق الأزرار (متناوب: 1, 2, 1)
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account"),
-        InlineKeyboardButton("📱 حساباتي المرتبطة", callback_data="my_accounts")
-    )
+    markup.add(InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account"))
+    markup.add(InlineKeyboardButton("📱 حساباتي المرتبطة", callback_data="my_accounts"), InlineKeyboardButton("🔄 تحديث الصفحة", callback_data="refresh_start"))
     if user_id == PRIMARY_ADMIN_ID:
         markup.add(InlineKeyboardButton("👥 إدارة الإدمنية", callback_data="manage_admins"))
     
-    owned = sum(1 for acc in DB_STATE["accounts"].values() if acc["owner_id"] == user_id)
-    await bot.send_message(
-        user_id,
-        f"👋 **أهلاً بك في لوحة تحكم اليوزر بوت المتقدمة**\n\n📱 حساباتك المرتبطة: **{owned}**",
-        reply_markup=markup, parse_mode="Markdown"
+    msg_text = (
+        f"**حياك الله في لوحة التحكم** 🤖\n\n"
+        f"> **يمكنك تصفح خدمات البوت من الازرار الموجودة في الاسفل 👇**\n"
+        f"ـ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ\n\n"
+        f"📱 حساباتك المرتبطة: **{owned}**"
     )
+    await bot.send_message(user_id, msg_text, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.message.chat.id in DB_STATE["admins"])
 async def callbacks(call):
     user_id = call.message.chat.id
     data = call.data
 
-    if data == "add_account":
+    if data == "refresh_start":
+        owned = sum(1 for acc in DB_STATE["accounts"].values() if acc["owner_id"] == user_id)
+        msg_text = (
+            f"**حياك الله في لوحة التحكم** 🤖\n\n"
+            f"> **يمكنك تصفح خدمات البوت من الازرار الموجودة في الاسفل 👇**\n"
+            f"ـ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ\n\n"
+            f"📱 حساباتك المرتبطة: **{owned}**"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account"))
+        markup.add(InlineKeyboardButton("📱 حساباتي المرتبطة", callback_data="my_accounts"), InlineKeyboardButton("🔄 تحديث الصفحة", callback_data="refresh_start"))
+        if user_id == PRIMARY_ADMIN_ID:
+            markup.add(InlineKeyboardButton("👥 إدارة الإدمنية", callback_data="manage_admins"))
+        try:
+            await bot.edit_message_text(msg_text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        except: pass
+        await bot.answer_callback_query(call.id, "✅ تم التحديث")
+
+    elif data == "add_account":
         user_states[user_id] = {"step": "phone"}
         await bot.send_message(user_id, "📱 أرسل رقم الحساب مع المفتاح الدولي (مثال: `+9665...`):\n(لإلغاء العملية أرسل `الغاء`)", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
@@ -443,7 +453,13 @@ async def callbacks(call):
         owned = [phone for phone, info in DB_STATE["accounts"].items() if info["owner_id"] == user_id]
         for phone in owned:
             markup.add(InlineKeyboardButton(f"📱 {phone}", callback_data=f"panel_{phone}"))
-        await bot.edit_message_text("👇 **حساباتك المرتبطة:**", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        
+        msg_text = (
+            f"**حساباتك المرتبطة** 📱\n\n"
+            f"> **اختر الحساب الذي تريد التحكم به من القائمة أدناه 👇**\n"
+            f"ـ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ"
+        )
+        await bot.edit_message_text(msg_text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("panel_"):
         phone = data.split("_")[1]
@@ -466,16 +482,31 @@ async def callbacks(call):
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
         storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
         
+        # تنسيق الأزرار (متناوب: 1, 2, 1, 2...) بشكل أنيق
         markup = InlineKeyboardMarkup()
+        # 1
         markup.add(InlineKeyboardButton(f"📥 حفظ الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
-        markup.add(InlineKeyboardButton(f"🔄 مهام النشر", callback_data=f"autopost_{phone}"), InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"))
+        # 2
+        markup.add(InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"), InlineKeyboardButton(f"🔄 مهام النشر", callback_data=f"autopost_{phone}"))
+        # 1
         markup.add(InlineKeyboardButton("⚔️ الرد المستمر", callback_data=f"raid_{phone}"))
-        markup.add(InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"), InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"))
-        markup.add(InlineKeyboardButton("🛡 إدارة الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
-        markup.add(InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"), InlineKeyboardButton("✍️ النبذة", callback_data=f"bio_{phone}"))
+        # 2
+        markup.add(InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"), InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"))
+        # 1
+        markup.add(InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
+        # 2
+        markup.add(InlineKeyboardButton("🛡 الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"))
+        # 1
+        markup.add(InlineKeyboardButton("✍️ تغيير النبذة", callback_data=f"bio_{phone}"))
+        # 2
         markup.add(InlineKeyboardButton("🗑 حذف وتسجيل خروج", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
         
-        await bot.edit_message_text(f"⚙️ **تحكم حساب: `{phone}`**", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        msg_text = (
+            f"**إعدادات الحساب: `{phone}`** ⚙️\n\n"
+            f"> **اختر من الخدمات أدناه للتحكم في حسابك بالكامل 👇**\n"
+            f"ـ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ ــ"
+        )
+        await bot.edit_message_text(msg_text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     # --- إعدادات الرد المستمر ---
     elif data.startswith("raid_"):
