@@ -26,7 +26,7 @@ user_states = {}
 RUNNING_CLIENTS = {}
 LAST_REPLY_TIME = {}
 
-# سجل تتبع الرشق (الليڤ ميكس) النشط
+# سجل تتبع الرد المستمر النشط
 ACTIVE_RAIDS = {}  # Format: { "phone": { "target_user_id": True/False } }
 
 # ==========================================
@@ -61,7 +61,7 @@ async def sync_from_channel():
                                     "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}, 
                                     "cached_groups": [], "shortcuts": {}, 
                                     "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
-                                    "raid": {"sentences": []} # إضافة الرشق
+                                    "raid": {"sentences": []}
                                 }
                             else:
                                 if "auto_save" not in info: info["auto_save"] = False
@@ -150,7 +150,7 @@ async def download_telebot_media(message):
         new_file.write(downloaded_file)
     return path
 
-# ====== مهمة تشغيل الرشق بالخلفية ======
+# ====== مهمة الرد المستمر ======
 async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sentences):
     while ACTIVE_RAIDS.get(phone, {}).get(target_user_id):
         for sentence in sentences:
@@ -158,17 +158,27 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
                 break  # خروج فوري إذا تم إيقافه
             try:
                 await client.send_message(chat_id, sentence, reply_to_message_id=target_msg_id)
-                # تأخير عشوائي للحماية من الحظر (FloodWait)
-                await asyncio.sleep(random.uniform(1.5, 3.0)) 
+                # تأخير عشوائي للحماية من الحظر
+                await asyncio.sleep(random.uniform(2.0, 3.5)) 
             except Exception as e:
-                await asyncio.sleep(5)
+                # إذا قام الشخص بحذف رسالته، نرسل بدون ريبلاي
+                if "MESSAGE_ID_INVALID" in str(e).upper():
+                    try:
+                        await client.send_message(chat_id, sentence)
+                        await asyncio.sleep(random.uniform(2.0, 3.5))
+                    except: pass
+                else:
+                    await asyncio.sleep(3)
 
-# ====== معالج الرشق (الليڤ ميكس) ======
-async def handle_raid_commands(client, message):
+# ====== معالج الرد المستمر ======
+async def handle_continuous_reply(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
     
     text = message.text.strip()
+    if text not in [".ضرب", ".ايقاف"]:
+        return
+
     raid_config = DB_STATE["accounts"].get(phone, {}).get("raid", {})
     sentences = raid_config.get("sentences", [])
     
@@ -177,29 +187,27 @@ async def handle_raid_commands(client, message):
     
     target_id = target_user.id
 
-    # تشغيل الرشق
+    # تشغيل الرد المستمر
     if text == ".ضرب":
         if not sentences:
-            await message.edit_text("❌ لم تقم بإضافة أي جمل للرشق من إعدادات البوت!")
+            await message.edit_text("❌ لم تقم بإضافة أي جمل للرد المستمر من إعدادات البوت!")
             return
             
         if phone not in ACTIVE_RAIDS: ACTIVE_RAIDS[phone] = {}
         
         if ACTIVE_RAIDS[phone].get(target_id):
-            await message.edit_text("⚠️ الرشق شغال بالفعل على هذا الشخص!")
+            await message.edit_text("⚠️ الرد المستمر شغال بالفعل على هذا الشخص!")
             return
             
         ACTIVE_RAIDS[phone][target_id] = True
-        await message.delete() # حذف رسالة الأمر
-        
-        # تشغيل المهمة في الخلفية
+        await message.delete() 
         asyncio.create_task(raid_worker(client, phone, message.chat.id, message.reply_to_message.id, target_id, sentences))
 
-    # إيقاف الرشق
+    # إيقاف الرد المستمر
     elif text == ".ايقاف":
         if phone in ACTIVE_RAIDS and ACTIVE_RAIDS[phone].get(target_id):
             ACTIVE_RAIDS[phone][target_id] = False
-            await message.edit_text("🛑 تم إيقاف الرشق عن هذا الشخص.")
+            await message.edit_text("🛑 تم إيقاف الرد المستمر عن هذا الشخص.")
             await asyncio.sleep(2)
             await message.delete()
 
@@ -346,16 +354,14 @@ async def start_single_client(phone, info):
         client = Client(
             f"acc_{phone}",
             session_string=session,
-            in_memory=True,
-            auto_reconnect=True,
-            sleep_threshold=60
+            in_memory=True
         )
         client.acc_phone = phone
-        client.add_handler(MessageHandler(handle_private_messages, filters.private & filters.incoming))
-        client.add_handler(MessageHandler(handle_user_shortcuts, filters.me & filters.text))
         
-        # إضافة معالج الرشق (يرد على رسائل بصيغة .ضرب أو .ايقاف)
-        client.add_handler(MessageHandler(handle_raid_commands, filters.me & filters.reply & filters.text))
+        # توزيع المهام بصلاحيات منفصلة لتجنب التداخل
+        client.add_handler(MessageHandler(handle_private_messages, filters.private & filters.incoming), group=1)
+        client.add_handler(MessageHandler(handle_user_shortcuts, filters.me & filters.text), group=2)
+        client.add_handler(MessageHandler(handle_continuous_reply, filters.me & filters.reply & filters.text), group=3)
         
         await client.start()
         client.my_id = (await client.get_me()).id
@@ -458,19 +464,20 @@ async def callbacks(call):
         acc_info = DB_STATE["accounts"].get(phone, {})
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
+        storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
         
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(f"📥 حفظ الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
-        markup.add(InlineKeyboardButton(f"🔄 النشر التلقائي", callback_data=f"autopost_{phone}"), InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"))
-        markup.add(InlineKeyboardButton("⚔️ الرد المستمر (الرشق)", callback_data=f"raid_{phone}"))
+        markup.add(InlineKeyboardButton(f"🔄 مهام النشر", callback_data=f"autopost_{phone}"), InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"))
+        markup.add(InlineKeyboardButton("⚔️ الرد المستمر", callback_data=f"raid_{phone}"))
         markup.add(InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"), InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"))
-        markup.add(InlineKeyboardButton("🛡 إدارة الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton(f"🛠 مجموعة التخزين", callback_data=f"fixstorage_{phone}"))
+        markup.add(InlineKeyboardButton("🛡 إدارة الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
         markup.add(InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"), InlineKeyboardButton("✍️ النبذة", callback_data=f"bio_{phone}"))
         markup.add(InlineKeyboardButton("🗑 حذف وتسجيل خروج", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
         
         await bot.edit_message_text(f"⚙️ **تحكم حساب: `{phone}`**", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-    # --- إعدادات الرشق (الرد المستمر) ---
+    # --- إعدادات الرد المستمر ---
     elif data.startswith("raid_"):
         phone = data.split("_")[1]
         raid_data = DB_STATE["accounts"][phone].get("raid", {"sentences": []})
@@ -483,11 +490,11 @@ async def callbacks(call):
         markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
         
         msg_text = (
-            f"⚔️ **إعدادات الرد المستمر (الرشق) - `{phone}`**\n\n"
+            f"⚔️ **إعدادات الرد المستمر - `{phone}`**\n\n"
             f"عدد الجمل المحفوظة: **{sentences_count}**\n\n"
             f"🔹 **طريقة الاستخدام:**\n"
             f"في أي محادثة، رد على رسالة الشخص واكتب: `.ضرب`\n"
-            f"لإيقاف الرشق، رد عليه واكتب: `.ايقاف`\n\n"
+            f"لإيقاف الرد المستمر، رد عليه واكتب: `.ايقاف`\n\n"
             f"*(ملاحظة: البوت سيرسل الجمل بالترتيب مع توقف زمني بسيط لحماية حسابك من الباند)*"
         )
         await bot.edit_message_text(msg_text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -502,7 +509,7 @@ async def callbacks(call):
         phone = data.split("_")[1]
         DB_STATE["accounts"][phone]["raid"]["sentences"] = []
         await save_to_channel()
-        await bot.answer_callback_query(call.id, "✅ تم مسح جميع جمل الرشق بنجاح!", show_alert=True)
+        await bot.answer_callback_query(call.id, "✅ تم مسح جميع جمل الرد المستمر بنجاح!", show_alert=True)
         call.data = f"raid_{phone}"
         await callbacks(call)
 
@@ -833,7 +840,7 @@ async def handle_inputs(message):
     state = user_states[user_id]
     step = state.get("step")
 
-    # --- إضافة الرشق (الليڤ ميكس) ---
+    # --- إضافة الرد المستمر ---
     if step == "add_raid_sentences":
         phone = state["phone"]
         text = message.text
@@ -841,15 +848,13 @@ async def handle_inputs(message):
             await bot.reply_to(message, "❌ أرسل نصاً فقط.")
             return
             
-        # تقسيم النص إلى سطور وحفظ كل سطر كجملة
         lines = [line.strip() for line in text.split('\n') if line.strip()]
-        
         DB_STATE["accounts"][phone]["raid"]["sentences"].extend(lines)
         await save_to_channel()
         user_states.pop(user_id, None)
         
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 رجوع لإعدادات الرشق", callback_data=f"raid_{phone}"))
+        markup.add(InlineKeyboardButton("🔙 رجوع لإعدادات الرد المستمر", callback_data=f"raid_{phone}"))
         await bot.reply_to(message, f"✅ تم إضافة **{len(lines)}** جمل بنجاح!", reply_markup=markup, parse_mode="Markdown")
 
     # --- إضافة الاستثناءات ---
