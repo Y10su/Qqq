@@ -17,6 +17,7 @@ from pyrogram.types import ChatPermissions
 # 1. إعدادات اليوزر بوت
 # ==========================================
 # ⚠️ تم تفريغ البيانات الحساسة لحمايتك. ضع بياناتك الجديدة هنا ⚠️
+
 BOT_TOKEN = "8666142908:AAFZhEu_McY2TEy_6wtGbB7RhjFbxF7fTeE"
 API_ID = 37129514
 API_HASH = "29af008f32ddd784867118d0a58fb8c6"
@@ -203,7 +204,7 @@ async def download_telebot_media(message):
         new_file.write(downloaded_file)
     return path
 
-# ====== مهمة الرد المستمر الذكية ======
+# ====== مهمة الرد المستمر الذكية (لا تتوقف أبداً) ======
 async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sentences, mode="sentences", speed=2.5, task_key=None):
     items_to_send = []
     if mode == "words":
@@ -216,6 +217,7 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
         return
 
     while True:
+        # فحص ما إذا كان الرشق لا يزال نشطاً في الذاكرة
         if phone not in ACTIVE_RAIDS:
             break
         task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS[phone])
@@ -225,30 +227,44 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
         for item in items_to_send:
             if not task_exists:
                 break
+            
             sent = False
-            while not sent and task_exists:
+            while not sent: # حلقة لا نهائية للإرسال حتى تنجح
+                # فحص سريع لعدم التعليق في حلقة لا نهائية لو تم إيقافه
+                task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS.get(phone, []))
+                if not task_exists:
+                    break
+                    
                 try:
-                    await client.send_message(chat_id, item, reply_to_message_id=target_msg_id)
+                    # إذا كان الـ target_msg_id سارياً، نرد عليه. وإلا نرسل مباشر.
+                    if target_msg_id:
+                        await client.send_message(chat_id, item, reply_to_message_id=target_msg_id)
+                    else:
+                        await client.send_message(chat_id, item)
                     sent = True
                     await asyncio.sleep(speed)
+                    
                 except FloodWait as e:
+                    # حظر تليجرام المؤقت
                     await asyncio.sleep(e.value + 1)
                 except Exception as e:
-                    err_str = str(e).upper()
-                    if "MESSAGE" in err_str or "REPLY" in err_str or "DELETED" in err_str or "INVALID" in err_str:
-                        try:
-                            await client.send_message(chat_id, item)
-                            sent = True
-                            await asyncio.sleep(speed)
-                        except FloodWait as fw:
-                            await asyncio.sleep(fw.value + 1)
-                        except:
+                    # اكتشاف وتجاوز جميع المشاكل بصمت
+                    if hasattr(e, 'value') and isinstance(getattr(e, 'value'), int):
+                        # لأي استثناء يمتلك وقت (مثل SlowmodeWait)
+                        await asyncio.sleep(e.value + 1)
+                    else:
+                        err_str = str(e).upper()
+                        # إذا حذف الضحية رسالته، نلغي الربط بها (target_msg_id = None) ونكمل بدونه
+                        if "MESSAGE" in err_str or "REPLY" in err_str or "DELETED" in err_str or "INVALID" in err_str:
+                            target_msg_id = None
+                            # لن يتم تفعيل sent = True، وسيعاد المحاولة فوراً بدون ريبلاي
+                        elif "FORBIDDEN" in err_str or "RESTRICTED" in err_str or "BANNED" in err_str or "SLOWMODE" in err_str:
+                            # كتم مؤقت للحساب، ننام 10 ثوانٍ ونجرب
+                            await asyncio.sleep(10)
+                        else:
+                            # مشكلة غريبة، نتجاوز الكلمة وننام ثانية
                             sent = True
                             await asyncio.sleep(1)
-                    else:
-                        sent = True
-                        await asyncio.sleep(1)
-            task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS.get(phone, []))
 
 # ====== معالج الرد المستمر (يعمل بصمت ويرسل للبوت) ======
 async def handle_continuous_reply(client, message):
@@ -276,7 +292,8 @@ async def handle_continuous_reply(client, message):
         parts = text.split()
         pkg_id = parts[1] if len(parts) > 1 else "1"
         if pkg_id not in packages:
-            await message.delete()
+            try: await message.delete()
+            except: pass
             try: await bot.send_message(owner_id, f"❌ قائمة الرد المستمر رقم `{pkg_id}` غير موجودة!")
             except: pass
             return
@@ -296,7 +313,8 @@ async def handle_continuous_reply(client, message):
                 pass
 
         if not target_user:
-            await message.delete()
+            try: await message.delete()
+            except: pass
             return
 
         target_id = target_user.id
@@ -323,14 +341,17 @@ async def handle_continuous_reply(client, message):
         })
         await save_to_channel()
 
-        await message.delete()
+        try: await message.delete()
+        except: pass
+        
         try: await bot.send_message(owner_id, f"⚔️ تم تشغيل الرد المستمر على `{target_user.first_name}` بنجاح.")
         except: pass
 
         asyncio.create_task(raid_worker(client, phone, message.chat.id, target_msg_id, target_id, pkg["sentences"], pkg["mode"], speed, task_key))
 
     elif text == raid_stop_cmd:
-        await message.delete()
+        try: await message.delete()
+        except: pass
 
         if message.reply_to_message and message.reply_to_message.from_user:
             target_id = message.reply_to_message.from_user.id
