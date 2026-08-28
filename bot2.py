@@ -468,10 +468,12 @@ async def handle_moderation_commands(client, message):
             await client.send_message(chat_id, "❌ ما عندك صلاحيات إشراف.")
             return
 
+        # حماية المالك والأدمن الأساسي من الكتم
+        protected_ids = {PRIMARY_ADMIN_ID, acc_info.get("owner_id", PRIMARY_ADMIN_ID)}
+
         if text.startswith(mute_cmd):
-            # منع كتم نفسك
-            if target_user.id == client.me.id:
-                return
+            if target_user.id in protected_ids:
+                return  # لا تكتم المالك أو الأدمن الأساسي
             if phone not in ACTIVE_MUTES:
                 ACTIVE_MUTES[phone] = set()
             ACTIVE_MUTES[phone].add(target_user.id)
@@ -516,7 +518,7 @@ async def handle_moderation_commands(client, message):
     except Exception as e:
         print(f"❌ خطأ في أوامر الإشراف: {e}")
 
-# معالج حذف رسائل المكتومين تلقائياً (مع استثناء المالك نهائياً)
+# معالج حذف رسائل المكتومين تلقائياً (مع حماية المالك)
 async def handle_mute_filter(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
@@ -524,9 +526,12 @@ async def handle_mute_filter(client, message):
         return
     if not message.from_user:
         return
+
     # لا تحذف رسائل المالك أبداً
-    if message.from_user.id == client.me.id:
+    owner_id = getattr(client, "owner_id", PRIMARY_ADMIN_ID)
+    if message.from_user.id in (owner_id, PRIMARY_ADMIN_ID):
         return
+
     if message.from_user.id in ACTIVE_MUTES[phone]:
         try:
             await message.delete()
@@ -719,6 +724,7 @@ async def start_single_client(phone, info):
             in_memory=True
         )
         client.acc_phone = phone
+        client.owner_id = info.get("owner_id", PRIMARY_ADMIN_ID)  # تخزين معرف المالك
 
         owner_id = info.get("owner_id", PRIMARY_ADMIN_ID)
 
