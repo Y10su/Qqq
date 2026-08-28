@@ -9,7 +9,7 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered, SessionRevoked
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered, SessionRevoked, FloodWait
 from pyrogram.enums import ChatType
 
 # ==========================================
@@ -59,7 +59,7 @@ async def sync_from_channel():
                                     "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}, 
                                     "cached_groups": [], "shortcuts": {}, 
                                     "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
-                                    "raid": {"sentences": []}
+                                    "raid": {"sentences": [], "active_targets": {}, "mode": "sentences"}
                                 }
                             else:
                                 if "auto_save" not in info: info["auto_save"] = False
@@ -71,7 +71,11 @@ async def sync_from_channel():
                                 if "shortcuts" not in info: info["shortcuts"] = {}
                                 if "exceptions" not in info: info["exceptions"] = {"storage": [], "autoreply": []}
                                 if "last_replies" not in info: info["last_replies"] = {}
-                                if "raid" not in info: info["raid"] = {"sentences": []}
+                                if "raid" not in info: 
+                                    info["raid"] = {"sentences": [], "active_targets": {}, "mode": "sentences"}
+                                else:
+                                    if "active_targets" not in info["raid"]: info["raid"]["active_targets"] = {}
+                                    if "mode" not in info["raid"]: info["raid"]["mode"] = "sentences"
                         DB_STATE["accounts"] = accounts
                         print(f"✅ تم استرجاع {len(DB_STATE['accounts'])} حساب محفوظ.")
                         return
@@ -148,23 +152,47 @@ async def download_telebot_media(message):
         new_file.write(downloaded_file)
     return path
 
-# ====== مهمة الرد المستمر ======
-async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sentences):
+# ====== مهمة الرد المستمر (تدعم الجمل والفرديات) ======
+async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sentences, mode="sentences"):
+    items_to_send = []
+    
+    if mode == "words":
+        for s in sentences:
+            items_to_send.extend(s.split())
+    else:
+        items_to_send = sentences
+
+    if not items_to_send:
+        return
+
     while ACTIVE_RAIDS.get(phone, {}).get(target_user_id):
-        for sentence in sentences:
+        for item in items_to_send:
             if not ACTIVE_RAIDS.get(phone, {}).get(target_user_id):
                 break
-            try:
-                await client.send_message(chat_id, sentence, reply_to_message_id=target_msg_id)
-                await asyncio.sleep(random.uniform(2.0, 3.5)) 
-            except Exception as e:
-                if "MESSAGE_ID_INVALID" in str(e).upper():
-                    try:
-                        await client.send_message(chat_id, sentence)
-                        await asyncio.sleep(random.uniform(2.0, 3.5))
-                    except: pass
-                else:
-                    await asyncio.sleep(3)
+            
+            sent = False
+            while not sent and ACTIVE_RAIDS.get(phone, {}).get(target_user_id):
+                try:
+                    await client.send_message(chat_id, item, reply_to_message_id=target_msg_id)
+                    sent = True
+                    await asyncio.sleep(random.uniform(2.0, 3.5)) 
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except Exception as e:
+                    err_str = str(e).upper()
+                    if "MESSAGE" in err_str or "REPLY" in err_str or "DELETED" in err_str or "INVALID" in err_str:
+                        try:
+                            await client.send_message(chat_id, item)
+                            sent = True
+                            await asyncio.sleep(random.uniform(2.0, 3.5))
+                        except FloodWait as fw:
+                            await asyncio.sleep(fw.value + 1)
+                        except:
+                            sent = True
+                            await asyncio.sleep(2)
+                    else:
+                        sent = True
+                        await asyncio.sleep(2)
 
 # ====== معالج الرد المستمر ======
 async def handle_continuous_reply(client, message):
@@ -177,6 +205,7 @@ async def handle_continuous_reply(client, message):
 
     raid_config = DB_STATE["accounts"].get(phone, {}).get("raid", {})
     sentences = raid_config.get("sentences", [])
+    mode = raid_config.get("mode", "sentences")
     
     target_user = message.reply_to_message.from_user if message.reply_to_message else None
     if not target_user: return
@@ -186,19 +215,38 @@ async def handle_continuous_reply(client, message):
         if not sentences:
             await message.edit_text("❌ لم تقم بإضافة أي جمل للرد المستمر من إعدادات البوت!")
             return
+            
         if phone not in ACTIVE_RAIDS: ACTIVE_RAIDS[phone] = {}
         if ACTIVE_RAIDS[phone].get(target_id):
             await message.edit_text("⚠️ الرد المستمر شغال بالفعل على هذا الشخص!")
             return
             
         ACTIVE_RAIDS[phone][target_id] = True
+        
+        if "active_targets" not in DB_STATE["accounts"][phone]["raid"]:
+            DB_STATE["accounts"][phone]["raid"]["active_targets"] = {}
+        DB_STATE["accounts"][phone]["raid"]["active_targets"][str(target_id)] = {
+            "chat_id": message.chat.id,
+            "target_msg_id": message.reply_to_message.id
+        }
+        await save_to_channel()
+        
         await message.delete() 
-        asyncio.create_task(raid_worker(client, phone, message.chat.id, message.reply_to_message.id, target_id, sentences))
+        asyncio.create_task(raid_worker(client, phone, message.chat.id, message.reply_to_message.id, target_id, sentences, mode))
 
     elif text == ".ايقاف":
+        target_id_str = str(target_id)
+        if target_id_str in DB_STATE["accounts"][phone]["raid"].get("active_targets", {}):
+            del DB_STATE["accounts"][phone]["raid"]["active_targets"][target_id_str]
+            await save_to_channel()
+            
         if phone in ACTIVE_RAIDS and ACTIVE_RAIDS[phone].get(target_id):
             ACTIVE_RAIDS[phone][target_id] = False
             await message.edit_text("🛑 تم إيقاف الرد المستمر عن هذا الشخص.")
+            await asyncio.sleep(2)
+            await message.delete()
+        else:
+            await message.edit_text("⚠️ لا يوجد رد مستمر نشط على هذا الشخص.")
             await asyncio.sleep(2)
             await message.delete()
 
@@ -358,10 +406,22 @@ async def start_single_client(phone, info):
         RUNNING_CLIENTS[phone] = client
         print(f"✅ الحساب {phone} متصل وجاهز.")
 
+        raid_config = info.get("raid", {})
+        sentences = raid_config.get("sentences", [])
+        mode = raid_config.get("mode", "sentences")
+        active_targets = raid_config.get("active_targets", {})
+        if sentences and active_targets:
+            if phone not in ACTIVE_RAIDS: ACTIVE_RAIDS[phone] = {}
+            for tgt_id_str, tgt_data in active_targets.items():
+                tgt_id = int(tgt_id_str)
+                ACTIVE_RAIDS[phone][tgt_id] = True
+                asyncio.create_task(raid_worker(client, phone, tgt_data["chat_id"], tgt_data["target_msg_id"], tgt_id, sentences, mode))
+
         tasks = info.get("autopost", [])
         for idx, task in enumerate(tasks):
             if task.get("active"):
                 asyncio.create_task(run_single_autopost(phone, idx, task))
+                
     except (AuthKeyUnregistered, SessionRevoked):
         print(f"⚠️ الجلسة منتهية للحساب {phone}، سيتم حذفه تلقائياً.")
         DB_STATE["accounts"].pop(phone, None)
@@ -405,7 +465,6 @@ async def start_cmd(message):
 
     owned = sum(1 for acc in DB_STATE["accounts"].values() if acc["owner_id"] == user_id)
     
-    # تنسيق الأزرار (متناوب: 1, 2, 1)
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account"))
     markup.add(InlineKeyboardButton("📱 حساباتي المرتبطة", callback_data="my_accounts"), InlineKeyboardButton("🔄 تحديث الصفحة", callback_data="refresh_start"))
@@ -482,23 +541,14 @@ async def callbacks(call):
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
         storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
         
-        # تنسيق الأزرار (متناوب: 1, 2, 1, 2...) بشكل أنيق
         markup = InlineKeyboardMarkup()
-        # 1
         markup.add(InlineKeyboardButton(f"📥 حفظ الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
-        # 2
         markup.add(InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"), InlineKeyboardButton(f"🔄 مهام النشر", callback_data=f"autopost_{phone}"))
-        # 1
         markup.add(InlineKeyboardButton("⚔️ الرد المستمر", callback_data=f"raid_{phone}"))
-        # 2
         markup.add(InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"), InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"))
-        # 1
         markup.add(InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
-        # 2
         markup.add(InlineKeyboardButton("🛡 الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"))
-        # 1
         markup.add(InlineKeyboardButton("✍️ تغيير النبذة", callback_data=f"bio_{phone}"))
-        # 2
         markup.add(InlineKeyboardButton("🗑 حذف وتسجيل خروج", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
         
         msg_text = (
@@ -511,24 +561,55 @@ async def callbacks(call):
     # --- إعدادات الرد المستمر ---
     elif data.startswith("raid_"):
         phone = data.split("_")[1]
-        raid_data = DB_STATE["accounts"][phone].get("raid", {"sentences": []})
+        raid_data = DB_STATE["accounts"][phone].get("raid", {"sentences": [], "mode": "sentences"})
         sentences_count = len(raid_data.get("sentences", []))
+        mode = raid_data.get("mode", "sentences")
+        mode_text = "جمل كاملة 📝" if mode == "sentences" else "كلمة كلمة (فرديات) 🔠"
         
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("➕ إضافة جمل", callback_data=f"addrds_{phone}"))
+        markup.add(InlineKeyboardButton("➕ إضافة جمل", callback_data=f"addrds_{phone}"), InlineKeyboardButton("👀 عرض الجمل", callback_data=f"viewrds_{phone}"))
+        markup.add(InlineKeyboardButton(f"⚙️ وضع الرشق: {mode_text}", callback_data=f"raidmode_{phone}"))
         if sentences_count > 0:
             markup.add(InlineKeyboardButton("🗑 مسح كل الجمل", callback_data=f"clrrds_{phone}"))
         markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
         
         msg_text = (
             f"⚔️ **إعدادات الرد المستمر - `{phone}`**\n\n"
-            f"عدد الجمل المحفوظة: **{sentences_count}**\n\n"
+            f"عدد الجمل المحفوظة: **{sentences_count}**\n"
+            f"وضع الإرسال الحالي: **{mode_text}**\n\n"
             f"🔹 **طريقة الاستخدام:**\n"
             f"في أي محادثة، رد على رسالة الشخص واكتب: `.ضرب`\n"
             f"لإيقاف الرد المستمر، رد عليه واكتب: `.ايقاف`\n\n"
-            f"*(ملاحظة: البوت سيرسل الجمل بالترتيب مع توقف زمني بسيط لحماية حسابك من الباند)*"
+            f"*(ملاحظة: البوت سيرسل الكلمات/الجمل بالترتيب مع توقف زمني بسيط لحماية حسابك من الباند)*"
         )
         await bot.edit_message_text(msg_text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("raidmode_"):
+        phone = data.split("_")[1]
+        current_mode = DB_STATE["accounts"][phone]["raid"].get("mode", "sentences")
+        new_mode = "words" if current_mode == "sentences" else "sentences"
+        DB_STATE["accounts"][phone]["raid"]["mode"] = new_mode
+        await save_to_channel()
+        call.data = f"raid_{phone}"
+        await callbacks(call)
+
+    elif data.startswith("viewrds_"):
+        phone = data.split("_")[1]
+        sentences = DB_STATE["accounts"][phone]["raid"].get("sentences", [])
+        if not sentences:
+            await bot.answer_callback_query(call.id, "❌ قائمة الجمل فارغة!", show_alert=True)
+            return
+            
+        text = "📝 **الجمل المحفوظة للرد المستمر:**\n\n"
+        for i, s in enumerate(sentences, 1):
+            text += f"{i}. {s}\n"
+            
+        if len(text) > 3800:
+            text = text[:3800] + "\n\n... (تم قص الباقي لأن القائمة طويلة جداً)"
+            
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 رجوع للإعدادات", callback_data=f"raid_{phone}"))
+        await bot.edit_message_text(text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("addrds_"):
         phone = data.split("_")[1]
@@ -540,7 +621,7 @@ async def callbacks(call):
         phone = data.split("_")[1]
         DB_STATE["accounts"][phone]["raid"]["sentences"] = []
         await save_to_channel()
-        await bot.answer_callback_query(call.id, "✅ تم مسح جميع جمل الرد المستمر بنجاح!", show_alert=True)
+        await bot.answer_callback_query(call.id, "✅ تم مسح جميع الجمل بنجاح!", show_alert=True)
         call.data = f"raid_{phone}"
         await callbacks(call)
 
@@ -990,7 +1071,7 @@ async def handle_inputs(message):
                 "autopost": [], "storage_chat_id": storage_chat_id, "storage_chat_link": storage_link,
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
                 "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
-                "raid": {"sentences": []}
+                "raid": {"sentences": [], "active_targets": {}, "mode": "sentences"}
             }
             await save_to_channel()
             await client.disconnect()
@@ -1017,7 +1098,7 @@ async def handle_inputs(message):
                 "autopost": [], "storage_chat_id": storage_chat_id, "storage_chat_link": storage_link,
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
                 "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
-                "raid": {"sentences": []}
+                "raid": {"sentences": [], "active_targets": {}, "mode": "sentences"}
             }
             await save_to_channel()
             await client.disconnect()
