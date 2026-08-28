@@ -16,7 +16,6 @@ from pyrogram.types import ChatPermissions
 # ==========================================
 # 1. إعدادات اليوزر بوت
 # ==========================================
-# ⚠️ تم تفريغ البيانات الحساسة لحمايتك. ضع بياناتك الجديدة هنا ⚠️
 BOT_TOKEN = "8666142908:AAFZhEu_McY2TEy_6wtGbB7RhjFbxF7fTeE"
 API_ID = 37129514
 API_HASH = "29af008f32ddd784867118d0a58fb8c6"
@@ -320,7 +319,6 @@ async def handle_continuous_reply(client, message):
         await save_to_channel()
 
         await message.delete()
-
         asyncio.create_task(raid_worker(client, phone, message.chat.id, target_msg_id, target_id, pkg["sentences"], pkg["mode"], speed, task_key))
 
     elif text == raid_stop_cmd:
@@ -377,7 +375,7 @@ async def handle_flash_command(client, message):
     except Exception as e:
         print(f"❌ خطأ في الفلش: {e}")
 
-# ====== معالج أوامر الحذف (تم إصلاحه بشكل كامل) ======
+# ====== معالج أوامر الحذف (إصلاح جذري) ======
 async def handle_purge_commands(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text:
@@ -391,95 +389,75 @@ async def handle_purge_commands(client, message):
     text = message.text.strip()
     chat_id = message.chat.id
     
-    # لا تتدخل في الرسائل العادية
-    if not (
-        text == purge_me_cmd
-        or text.startswith(purge_cmd + " ")
-        or text == purge_cmd
-    ):
+    # التأكد أن الرسالة تخص أحد أوامر المسح
+    if not (text == purge_me_cmd or text.startswith(purge_cmd + " ") or text == purge_cmd):
         return
         
-    # الآن فقط نحذف رسالة الأمر نفسها
     try:
         await message.delete()
     except Exception:
         pass
         
-    # =========================
-    # مسح رسائلي
-    # =========================
+    # 1. أمر مسح رسائلي (.مسح رسائلي)
     if text == purge_me_cmd:
         try:
-            async for msg in client.search_messages(
-                chat_id,
-                from_user=client.me.id,
-                limit=0
-            ):
-                try:
-                    await msg.delete()
-                    await asyncio.sleep(0.3)
-                except FloodWait as e:
-                    await asyncio.sleep(e.value + 1)
-                except Exception:
-                    continue
+            msg_ids = []
+            async for msg in client.search_messages(chat_id, from_user=client.me.id, limit=200):
+                msg_ids.append(msg.id)
+            if msg_ids:
+                for i in range(0, len(msg_ids), 100):
+                    try:
+                        await client.delete_messages(chat_id, msg_ids[i:i+100])
+                        await asyncio.sleep(0.5)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
         except Exception as e:
             print(f"❌ خطأ في مسح رسائلي: {e}")
         return
         
-    # =========================
-    # مسح عدد محدد
-    # مثال: .مسح 20
-    # =========================
-    if text == purge_cmd or text.startswith(purge_cmd + " "):
+    # 2. أمر مسح عدد محدد (.مسح 50)
+    if text.startswith(purge_cmd + " "):
         parts = text.split()
         if len(parts) >= 2:
             try:
                 count = int(parts[1])
-                count = max(1, min(count, 100))
+                count = max(1, min(count, 500)) # حد أقصى 500 رسالة حماية
             except ValueError:
                 return
             try:
-                messages = []
-                async for msg in client.get_chat_history(
-                    chat_id,
-                    limit=count
-                ):
-                    messages.append(msg)
-                for msg in messages:
-                    try:
-                        await msg.delete()
-                        await asyncio.sleep(0.3)
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value + 1)
-                    except Exception:
-                        continue
+                msg_ids = []
+                async for msg in client.get_chat_history(chat_id, limit=count):
+                    msg_ids.append(msg.id)
+                if msg_ids:
+                    for i in range(0, len(msg_ids), 100):
+                        try:
+                            await client.delete_messages(chat_id, msg_ids[i:i+100])
+                            await asyncio.sleep(0.5)
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value + 1)
             except Exception as e:
                 print(f"❌ خطأ في مسح {count} رسالة: {e}")
             return
             
-        # =========================
-        # مسح رسائل الشخص بالرد عليه
-        # =========================
-        if message.reply_to_message and message.reply_to_message.from_user:
-            target_user = message.reply_to_message.from_user
-            try:
-                async for msg in client.search_messages(
-                    chat_id,
-                    from_user=target_user.id,
-                    limit=0
-                ):
+    # 3. أمر مسح بالرد على رسالة (.مسح)
+    if text == purge_cmd and message.reply_to_message:
+        try:
+            start_id = message.reply_to_message.id
+            end_id = message.id
+            # جمع الآيديات من الرسالة المردود عليها إلى رسالة الأمر
+            msg_ids = list(range(start_id, end_id + 1))
+            if msg_ids:
+                for i in range(0, len(msg_ids), 100):
                     try:
-                        await msg.delete()
-                        await asyncio.sleep(0.3)
+                        await client.delete_messages(chat_id, msg_ids[i:i+100])
+                        await asyncio.sleep(0.5)
                     except FloodWait as e:
                         await asyncio.sleep(e.value + 1)
-                    except Exception:
-                        continue
-            except Exception as e:
-                print(f"❌ خطأ في مسح رسائل الشخص: {e}")
-            return
+        except Exception as e:
+            print(f"❌ خطأ في مسح بالرد: {e}")
+        return
 
-# ====== معالج أوامر الإشراف (كتم، حظر، تقييد) ======
+# ====== معالج أوامر الإشراف (إزالة الحصانة) ======
 async def handle_moderation_commands(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
@@ -509,15 +487,12 @@ async def handle_moderation_commands(client, message):
     try:
         me = await client.get_chat_member(chat_id, "me")
         if not me.privileges:
-            await client.send_message(chat_id, "❌ ما عندك صلاحيات إشراف.")
+            try: await client.send_message(chat_id, "❌ ما عندك صلاحيات إشراف في هذه المجموعة.")
+            except: pass
             return
 
-        # حماية المالك والأدمن الأساسي من الكتم نهائياً
-        protected_ids = {client.me.id, acc_info.get("owner_id", PRIMARY_ADMIN_ID), PRIMARY_ADMIN_ID}
-
+        # أمر الكتم الفوري (الذي يقوم بحذف الرسائل تلقائياً) يعمل على الجميع
         if text.startswith(mute_cmd):
-            if target_user.id in protected_ids:
-                return  
             if phone not in ACTIVE_MUTES:
                 ACTIVE_MUTES[phone] = set()
             ACTIVE_MUTES[phone].add(target_user.id)
@@ -526,8 +501,11 @@ async def handle_moderation_commands(client, message):
             if target_user.id not in DB_STATE["accounts"][phone]["muted_users"]:
                 DB_STATE["accounts"][phone]["muted_users"].append(target_user.id)
             await save_to_channel()
+            try: await client.send_message(chat_id, f"✅ تم كتم `{target_user.first_name}` بنجاح.")
+            except: pass
             return
 
+        # أمر الغاء الكتم الفوري
         if text.startswith(unmute_cmd):
             if phone in ACTIVE_MUTES:
                 ACTIVE_MUTES[phone].discard(target_user.id)
@@ -535,17 +513,20 @@ async def handle_moderation_commands(client, message):
                 if target_user.id in DB_STATE["accounts"][phone]["muted_users"]:
                     DB_STATE["accounts"][phone]["muted_users"].remove(target_user.id)
                     await save_to_channel()
+            try: await client.send_message(chat_id, f"✅ تم إلغاء كتم `{target_user.first_name}` بنجاح.")
+            except: pass
             return
 
         if text.startswith(ban_cmd):
-            if not me.privileges.can_restrict_members:
+            if not getattr(me.privileges, 'can_restrict_members', False):
                 await client.send_message(chat_id, "❌ ما عندك صلاحية الحظر.")
                 return
             await client.ban_chat_member(chat_id, target_user.id)
+            await client.send_message(chat_id, f"⛔ تم حظر `{target_user.first_name}` نهائياً.")
             return
 
         if text.startswith(restrict_cmd):
-            if not me.privileges.can_restrict_members:
+            if not getattr(me.privileges, 'can_restrict_members', False):
                 await client.send_message(chat_id, "❌ ما عندك صلاحية التقييد.")
                 return
             await client.restrict_chat_member(
@@ -553,16 +534,17 @@ async def handle_moderation_commands(client, message):
                 target_user.id,
                 permissions=ChatPermissions(
                     can_send_messages=False,
-                    can_send_media=False,
-                    can_send_other=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
                     can_add_web_page_previews=False
                 )
             )
+            await client.send_message(chat_id, f"🔇 تم تقييد `{target_user.first_name}`.")
             return
     except Exception as e:
         print(f"❌ خطأ في أوامر الإشراف: {e}")
 
-# معالج حذف رسائل المكتومين تلقائياً
+# معالج حذف رسائل المكتومين تلقائياً (يعمل بصمت)
 async def handle_mute_filter(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
@@ -571,10 +553,7 @@ async def handle_mute_filter(client, message):
     if not message.from_user:
         return
 
-    owner_id = getattr(client, "owner_id", None)
-    if message.from_user.id in (client.me.id, owner_id, PRIMARY_ADMIN_ID):
-        return
-
+    # مسح الرسالة بغض النظر عن هوية المرسل ما دام في القائمة
     if message.from_user.id in ACTIVE_MUTES[phone]:
         try:
             await message.delete()
@@ -941,9 +920,7 @@ async def callbacks(call):
         markup.add(InlineKeyboardButton("⚔️ قوائم الرد المستمر (الرشق)", callback_data=f"raid_{phone}"))
         markup.add(InlineKeyboardButton("⚙️ إعداد الرد", callback_data=f"autoreply_setup_{phone}"), InlineKeyboardButton(f"💬 الرد التلقائي: {reply_status}", callback_data=f"autoreply_toggle_{phone}"))
         markup.add(InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
-        markup.add(InlineKeyboardButton("🛡 الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"))
-        markup.add(InlineKeyboardButton("✍️ تغيير النبذة", callback_data=f"bio_{phone}"))
-        markup.add(InlineKeyboardButton("⚙️ تخصيص الأوامر", callback_data=f"custom_cmds_{phone}"))
+        markup.add(InlineKeyboardButton("🛡 الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton("⚙️ تخصيص الأوامر", callback_data=f"custom_cmds_{phone}"))
         markup.add(InlineKeyboardButton("🗑 حذف وتسجيل خروج", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
 
         msg_text = (
@@ -1130,7 +1107,7 @@ async def callbacks(call):
 
                 await bot.answer_callback_query(call.id, "✅ مجموعة التخزين موجودة ومسجلة في القاعدة وتعمل بشكل سليم!", show_alert=True)
                 return
-            except Exception: pass
+            except Exception: pass 
 
         await bot.answer_callback_query(call.id, "⏳ جاري إنشاء المجموعة...")
         storage_id, link = await create_storage_group(client)
@@ -1382,18 +1359,6 @@ async def callbacks(call):
             return
         user_states[user_id] = {"step": "edit_custom_cmd", "phone": phone, "cmd_key": cmd_key}
         await bot.send_message(user_id, f"✍️ أرسل الأمر الجديد بدلاً من `{cmd_key}`:")
-        await bot.answer_callback_query(call.id)
-
-    elif data.startswith("bio_"):
-        phone = data.split("_")[1]
-        user_states[user_id] = {"step": "wait_bio", "phone": phone}
-        await bot.send_message(user_id, "✍️ أرسل النبذة (Bio) الجديدة الآن:\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
-        await bot.answer_callback_query(call.id)
-
-    elif data.startswith("join_"):
-        phone = data.split("_")[1]
-        user_states[user_id] = {"step": "wait_link", "phone": phone}
-        await bot.send_message(user_id, "🔗 أرسل رابط القناة أو الجروب:\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
 
     elif data.startswith("delete_"):
