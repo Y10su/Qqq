@@ -468,12 +468,12 @@ async def handle_moderation_commands(client, message):
             await client.send_message(chat_id, "❌ ما عندك صلاحيات إشراف.")
             return
 
-        # حماية المالك والأدمن الأساسي من الكتم
-        protected_ids = {PRIMARY_ADMIN_ID, acc_info.get("owner_id", PRIMARY_ADMIN_ID)}
+        # حماية المالك والأدمن الأساسي من الكتم نهائياً
+        protected_ids = {client.me.id, acc_info.get("owner_id", PRIMARY_ADMIN_ID), PRIMARY_ADMIN_ID}
 
         if text.startswith(mute_cmd):
             if target_user.id in protected_ids:
-                return  # لا تكتم المالك أو الأدمن الأساسي
+                return  # لا تكتم المالك أو الأدمن الأساسي أو الحساب نفسه
             if phone not in ACTIVE_MUTES:
                 ACTIVE_MUTES[phone] = set()
             ACTIVE_MUTES[phone].add(target_user.id)
@@ -527,9 +527,9 @@ async def handle_mute_filter(client, message):
     if not message.from_user:
         return
 
-    # لا تحذف رسائل المالك أبداً
-    owner_id = getattr(client, "owner_id", PRIMARY_ADMIN_ID)
-    if message.from_user.id in (owner_id, PRIMARY_ADMIN_ID):
+    # لا تحذف رسائل الحساب نفسه أو المالك أو الأدمن الأساسي
+    owner_id = getattr(client, "owner_id", None)
+    if message.from_user.id in (client.me.id, owner_id, PRIMARY_ADMIN_ID):
         return
 
     if message.from_user.id in ACTIVE_MUTES[phone]:
