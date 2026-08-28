@@ -11,6 +11,7 @@ from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered, SessionRevoked, FloodWait
 from pyrogram.enums import ChatType
+from pyrogram.types import ChatPermissions
 
 # ==========================================
 # 1. إعدادات اليوزر بوت
@@ -25,16 +26,31 @@ bot = AsyncTeleBot(BOT_TOKEN)
 user_states = {}
 RUNNING_CLIENTS = {}
 LAST_REPLY_TIME = {}
-ACTIVE_RAIDS = {}  # الآن ستصبح قائمة من المهام لكل حساب
+ACTIVE_RAIDS = {}
+ACTIVE_MUTES = {}
 
 # ==========================================
 # 2. نظام قاعدة البيانات السحابية الحية
 # ==========================================
 DB_STATE = {
     "admins": [PRIMARY_ADMIN_ID],
-    "accounts": {} 
+    "accounts": {}
 }
 DB_MESSAGE_ID = None
+
+CUSTOM_COMMAND_KEYS = ["raid_start", "raid_stop", "flash", "purge", "purge_me", "mute", "unmute", "ban", "restrict"]
+
+DEFAULT_CUSTOM_COMMANDS = {
+    "raid_start": ".ضرب",
+    "raid_stop": ".ايقاف",
+    "flash": ".فلش",
+    "purge": ".مسح",
+    "purge_me": ".مسح رسائلي",
+    "mute": ".كتم",
+    "unmute": ".الغاء كتم",
+    "ban": ".حظر",
+    "restrict": ".تقييد"
+}
 
 async def sync_from_channel():
     global DB_STATE, DB_MESSAGE_ID
@@ -49,24 +65,21 @@ async def sync_from_channel():
                     try:
                         data = json.loads(match.group(1))
                         DB_STATE["admins"] = list(set(data.get("admins", []) + [PRIMARY_ADMIN_ID]))
-                        
+
                         accounts = data.get("accounts", {})
                         for phone, info in accounts.items():
                             if isinstance(info, str):
                                 accounts[phone] = {
-                                    "session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False, 
+                                    "session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False,
                                     "autopost": [], "storage_chat_id": None, "storage_chat_link": None,
-                                    "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3}, 
-                                    "cached_groups": [], "shortcuts": {}, 
+                                    "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
+                                    "cached_groups": [], "shortcuts": {},
                                     "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
                                     "raid": {"packages": {}, "active_targets": []},
                                     "raid_speed": 2.5,
-                                    "custom_commands": {
-                                        "raid_start": ".ضرب",
-                                        "raid_stop": ".ايقاف",
-                                        "flash": ".فلش"
-                                    },
-                                    "temp_sentences": []
+                                    "custom_commands": DEFAULT_CUSTOM_COMMANDS.copy(),
+                                    "temp_sentences": [],
+                                    "muted_users": []
                                 }
                             else:
                                 if "auto_save" not in info: info["auto_save"] = False
@@ -79,20 +92,21 @@ async def sync_from_channel():
                                 if "exceptions" not in info: info["exceptions"] = {"storage": [], "autoreply": []}
                                 if "last_replies" not in info: info["last_replies"] = {}
                                 if "raid_speed" not in info: info["raid_speed"] = 2.5
-                                if "custom_commands" not in info:
-                                    info["custom_commands"] = {
-                                        "raid_start": ".ضرب",
-                                        "raid_stop": ".ايقاف",
-                                        "flash": ".فلش"
-                                    }
                                 if "temp_sentences" not in info: info["temp_sentences"] = []
-                                
-                                if "raid" not in info: 
+                                if "muted_users" not in info: info["muted_users"] = []
+
+                                if "custom_commands" not in info:
+                                    info["custom_commands"] = DEFAULT_CUSTOM_COMMANDS.copy()
+                                else:
+                                    for key in CUSTOM_COMMAND_KEYS:
+                                        if key not in info["custom_commands"]:
+                                            info["custom_commands"][key] = DEFAULT_CUSTOM_COMMANDS[key]
+
+                                if "raid" not in info:
                                     info["raid"] = {"packages": {}, "active_targets": []}
                                 else:
                                     if "packages" not in info["raid"]:
                                         info["raid"]["packages"] = {}
-                                        # محاولة تحويل البيانات القديمة
                                         if "sentences" in info["raid"]:
                                             if info["raid"]["sentences"]:
                                                 info["raid"]["packages"]["1"] = {
@@ -102,7 +116,6 @@ async def sync_from_channel():
                                                 }
                                             del info["raid"]["sentences"]
                                             if "mode" in info["raid"]: del info["raid"]["mode"]
-                                    # تحويل active_targets القديمة إذا كانت dict إلى قائمة
                                     if "active_targets" in info["raid"]:
                                         if isinstance(info["raid"]["active_targets"], dict):
                                             new_targets = []
@@ -112,7 +125,7 @@ async def sync_from_channel():
                                             info["raid"]["active_targets"] = new_targets
                                     else:
                                         info["raid"]["active_targets"] = []
-                                        
+
                         DB_STATE["accounts"] = accounts
                         print(f"✅ تم استرجاع {len(DB_STATE['accounts'])} حساب محفوظ.")
                         return
@@ -179,7 +192,7 @@ async def download_telebot_media(message):
     elif message.audio: file_id = message.audio.file_id; ext = ".mp3"
     elif message.document: file_id = message.document.file_id; ext = getattr(message.document, "file_name", ".tmp")
     elif message.video_note: file_id = message.video_note.file_id; ext = ".mp4"
-    
+
     if not file_id: return None
     file_info = await bot.get_file(file_id)
     downloaded_file = await bot.download_file(file_info.file_path)
@@ -202,7 +215,6 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
         return
 
     while True:
-        # التحقق من أن المهمة ما زالت نشطة
         if phone not in ACTIVE_RAIDS:
             break
         task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS[phone])
@@ -235,117 +247,121 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
                     else:
                         sent = True
                         await asyncio.sleep(1)
-            # إعادة فحص وجود المهمة
             task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS.get(phone, []))
 
 # ====== معالج الرد المستمر بالقوائم ======
 async def handle_continuous_reply(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
-    
+
     acc_info = DB_STATE["accounts"].get(phone, {})
     commands = acc_info.get("custom_commands", {})
     raid_start_cmd = commands.get("raid_start", ".ضرب")
     raid_stop_cmd = commands.get("raid_stop", ".ايقاف")
-    
+
     text = message.text.strip()
     if not text.startswith(raid_start_cmd) and text != raid_stop_cmd:
         return
 
     raid_config = acc_info.get("raid", {})
     packages = raid_config.get("packages", {})
-    
-    # الحصول على الهدف إن وجد
-    target_user = message.reply_to_message.from_user if message.reply_to_message else None
+
+    target_user = None
+    target_msg_id = None
 
     if text.startswith(raid_start_cmd):
-        if not target_user:
-            await message.delete()
-            return
-        target_id = target_user.id
         parts = text.split()
         pkg_id = parts[1] if len(parts) > 1 else "1"
-        
         if pkg_id not in packages:
             await message.delete()
             return
-            
         pkg = packages[pkg_id]
+
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            target_msg_id = message.reply_to_message.id
+        else:
+            try:
+                async for msg in client.get_chat_history(message.chat.id, limit=20):
+                    if msg.from_user and msg.from_user.id != client.my_id and not msg.from_user.is_bot:
+                        target_user = msg.from_user
+                        target_msg_id = msg.id
+                        break
+            except Exception:
+                pass
+
+        if not target_user:
+            await message.delete()
+            return
+
+        target_id = target_user.id
         speed = acc_info.get("raid_speed", 2.5)
-        
-        # إنشاء مهمة جديدة
+
         task_key = f"{phone}_{target_id}_{int(time.time())}_{random.randint(1000,9999)}"
         if phone not in ACTIVE_RAIDS:
             ACTIVE_RAIDS[phone] = []
-        
+
         ACTIVE_RAIDS[phone].append({
             "key": task_key,
             "target_id": target_id,
             "chat_id": message.chat.id,
-            "target_msg_id": message.reply_to_message.id,
+            "target_msg_id": target_msg_id,
             "pkg_id": pkg_id
         })
-        
-        # إضافة إلى قاعدة البيانات
+
         DB_STATE["accounts"][phone]["raid"]["active_targets"].append({
             "target_id": target_id,
             "chat_id": message.chat.id,
-            "target_msg_id": message.reply_to_message.id,
+            "target_msg_id": target_msg_id,
             "pkg_id": pkg_id,
             "key": task_key
         })
         await save_to_channel()
-        
-        # حذف رسالة الأمر
+
         await message.delete()
-        
-        # تشغيل المهمة
-        asyncio.create_task(raid_worker(client, phone, message.chat.id, message.reply_to_message.id, target_id, pkg["sentences"], pkg["mode"], speed, task_key))
+
+        asyncio.create_task(raid_worker(client, phone, message.chat.id, target_msg_id, target_id, pkg["sentences"], pkg["mode"], speed, task_key))
 
     elif text == raid_stop_cmd:
-        # حذف رسالة الأمر
         await message.delete()
-        
-        if target_user:
-            # إيقاف المهام الخاصة بهذا الهدف فقط
-            target_id = target_user.id
+
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_id = message.reply_to_message.from_user.id
             if phone in ACTIVE_RAIDS:
                 tasks_to_remove = [t for t in ACTIVE_RAIDS[phone] if t["target_id"] == target_id]
                 for t in tasks_to_remove:
                     ACTIVE_RAIDS[phone].remove(t)
-                # إزالة من قاعدة البيانات
                 DB_STATE["accounts"][phone]["raid"]["active_targets"] = [
                     a for a in DB_STATE["accounts"][phone]["raid"]["active_targets"]
                     if a["target_id"] != target_id
                 ]
                 await save_to_channel()
         else:
-            # إيقاف جميع المهام
             if phone in ACTIVE_RAIDS:
                 ACTIVE_RAIDS[phone].clear()
             DB_STATE["accounts"][phone]["raid"]["active_targets"] = []
             await save_to_channel()
 
-# ====== معالج أمر الفلش (طرد الجميع) ======
+# ====== معالج أمر الفلش ======
 async def handle_flash_command(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
-    
+
     acc_info = DB_STATE["accounts"].get(phone, {})
     flash_cmd = acc_info.get("custom_commands", {}).get("flash", ".فلش")
-    
+
     if message.text.strip() != flash_cmd:
         return
-    
+
     await message.delete()
-    
+
     chat_id = message.chat.id
     try:
         me = await client.get_chat_member(chat_id, "me")
         if not me.privileges or not me.privileges.can_restrict_members:
             await client.send_message(chat_id, "❌ ما عندك صلاحية الحظر.")
             return
-        
+
         async for member in client.get_chat_members(chat_id):
             if member.user.is_bot or member.status in ("administrator", "creator"):
                 continue
@@ -356,18 +372,176 @@ async def handle_flash_command(client, message):
                 await asyncio.sleep(e.value + 1)
             except Exception:
                 continue
-                
+
     except Exception as e:
         print(f"❌ خطأ في الفلش: {e}")
+
+# ====== معالج أوامر الحذف ======
+async def handle_purge_commands(client, message):
+    phone = getattr(client, "acc_phone", None)
+    if not phone or not message.text: return
+
+    acc_info = DB_STATE["accounts"].get(phone, {})
+    custom_cmds = acc_info.get("custom_commands", {})
+    purge_cmd = custom_cmds.get("purge", ".مسح")
+    purge_me_cmd = custom_cmds.get("purge_me", ".مسح رسائلي")
+
+    text = message.text.strip()
+    chat_id = message.chat.id
+    me = None
+    try:
+        me = await client.get_me()
+    except: pass
+    my_id = me.id if me else None
+
+    await message.delete()
+
+    if text.startswith(purge_me_cmd):
+        if not my_id:
+            return
+        try:
+            async for msg in client.search_messages(chat_id, from_user=my_id, limit=0):
+                try:
+                    await msg.delete()
+                    await asyncio.sleep(0.3)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except: continue
+        except Exception as e:
+            print(f"❌ خطأ في مسح رسائلي: {e}")
+        return
+
+    if text.startswith(purge_cmd):
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                count = int(parts[1])
+                count = max(1, min(count, 100))
+                messages = []
+                async for msg in client.get_chat_history(chat_id, limit=count + 1):
+                    messages.append(msg)
+                for msg in messages:
+                    try:
+                        await msg.delete()
+                        await asyncio.sleep(0.3)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                    except: continue
+            except ValueError:
+                pass
+            return
+
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            try:
+                async for msg in client.search_messages(chat_id, from_user=target_user.id, limit=0):
+                    try:
+                        await msg.delete()
+                        await asyncio.sleep(0.3)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 1)
+                    except: continue
+            except Exception as e:
+                print(f"❌ خطأ في مسح رسائل الشخص: {e}")
+
+# ====== معالج أوامر الإشراف ======
+async def handle_moderation_commands(client, message):
+    phone = getattr(client, "acc_phone", None)
+    if not phone or not message.text: return
+
+    acc_info = DB_STATE["accounts"].get(phone, {})
+    custom_cmds = acc_info.get("custom_commands", {})
+    mute_cmd = custom_cmds.get("mute", ".كتم")
+    unmute_cmd = custom_cmds.get("unmute", ".الغاء كتم")
+    ban_cmd = custom_cmds.get("ban", ".حظر")
+    restrict_cmd = custom_cmds.get("restrict", ".تقييد")
+
+    text = message.text.strip()
+    chat_id = message.chat.id
+
+    if not text.startswith((mute_cmd, unmute_cmd, ban_cmd, restrict_cmd)):
+        return
+
+    target_user = message.reply_to_message.from_user if message.reply_to_message else None
+    if not target_user:
+        await message.delete()
+        return
+
+    await message.delete()
+
+    try:
+        me = await client.get_chat_member(chat_id, "me")
+        if not me.privileges:
+            await client.send_message(chat_id, "❌ ما عندك صلاحيات إشراف.")
+            return
+
+        if text.startswith(mute_cmd):
+            if phone not in ACTIVE_MUTES:
+                ACTIVE_MUTES[phone] = set()
+            ACTIVE_MUTES[phone].add(target_user.id)
+            if "muted_users" not in DB_STATE["accounts"][phone]:
+                DB_STATE["accounts"][phone]["muted_users"] = []
+            if target_user.id not in DB_STATE["accounts"][phone]["muted_users"]:
+                DB_STATE["accounts"][phone]["muted_users"].append(target_user.id)
+            await save_to_channel()
+            return
+
+        if text.startswith(unmute_cmd):
+            if phone in ACTIVE_MUTES:
+                ACTIVE_MUTES[phone].discard(target_user.id)
+            if "muted_users" in DB_STATE["accounts"][phone]:
+                if target_user.id in DB_STATE["accounts"][phone]["muted_users"]:
+                    DB_STATE["accounts"][phone]["muted_users"].remove(target_user.id)
+                    await save_to_channel()
+            return
+
+        if text.startswith(ban_cmd):
+            if not me.privileges.can_restrict_members:
+                await client.send_message(chat_id, "❌ ما عندك صلاحية الحظر.")
+                return
+            await client.ban_chat_member(chat_id, target_user.id)
+            return
+
+        if text.startswith(restrict_cmd):
+            if not me.privileges.can_restrict_members:
+                await client.send_message(chat_id, "❌ ما عندك صلاحية التقييد.")
+                return
+            await client.restrict_chat_member(
+                chat_id,
+                target_user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media=False,
+                    can_send_other=False,
+                    can_add_web_page_previews=False
+                )
+            )
+            return
+    except Exception as e:
+        print(f"❌ خطأ في أوامر الإشراف: {e}")
+
+# معالج حذف رسائل المكتومين تلقائياً
+async def handle_mute_filter(client, message):
+    phone = getattr(client, "acc_phone", None)
+    if not phone: return
+    if phone not in ACTIVE_MUTES:
+        return
+    if not message.from_user:
+        return
+    if message.from_user.id in ACTIVE_MUTES[phone]:
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
 # ====== الاختصارات ======
 async def handle_user_shortcuts(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
-    
+
     shortcuts = DB_STATE["accounts"].get(phone, {}).get("shortcuts", {})
     text = message.text.strip()
-    
+
     if text in shortcuts:
         shortcut = shortcuts[text]
         try:
@@ -389,7 +563,7 @@ async def handle_private_messages(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
     acc_info = DB_STATE["accounts"].get(phone, {})
-    
+
     my_id = getattr(client, "my_id", None)
     user = message.from_user
     if not user: return
@@ -397,13 +571,13 @@ async def handle_private_messages(client, message):
     user_id_str = str(user.id)
     username = f"@{user.username.lower()}" if user.username else ""
     exceptions = acc_info.get("exceptions", {"storage": [], "autoreply": []})
-    
+
     is_storage_exc = False
     if user_id_str in exceptions["storage"] or (username and username in exceptions["storage"]):
         is_storage_exc = True
-        
+
     is_reply_exc = False
-    if user.id == my_id or user.is_bot: 
+    if user.id == my_id or user.is_bot:
         is_reply_exc = True
     elif user_id_str in exceptions["autoreply"] or (username and username in exceptions["autoreply"]):
         is_reply_exc = True
@@ -421,7 +595,7 @@ async def handle_private_messages(client, message):
         except:
             link = acc_info.get("storage_chat_link")
             if link:
-                try: 
+                try:
                     await client.join_chat(link)
                     await message.forward(int(storage_id))
                 except: pass
@@ -432,18 +606,18 @@ async def handle_private_messages(client, message):
         last_replies = acc_info.get("last_replies", {})
         last_time = last_replies.get(user_id_str, 0)
         current_time = time.time()
-        
+
         if (current_time - last_time) >= cooldown_sec:
             try:
                 await client.send_message(user.id, auto_reply["msg"])
-                DB_STATE["accounts"][phone]["last_replies"][user_id_str] = current_time 
-                asyncio.create_task(save_to_channel())  
+                DB_STATE["accounts"][phone]["last_replies"][user_id_str] = current_time
+                asyncio.create_task(save_to_channel())
             except: pass
 
 async def save_ttl_media(client, message, acc_info, user):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
-    
+
     try:
         path = None
         for attempt in range(3):
@@ -455,23 +629,23 @@ async def save_ttl_media(client, message, acc_info, user):
                     await asyncio.sleep(0.5)
             except Exception:
                 await asyncio.sleep(0.5)
-        
+
         if not path:
             return
-            
+
         sender_name = user.first_name if user else "مجهول"
         sender_id = user.id if user else "غير معروف"
         caption = f"🤫 **تم صيد رسالة ذاتية التدمير!**\nالمرسل: {sender_name} (ID: {sender_id})\nالنوع: "
-        
+
         storage_id = acc_info.get("storage_chat_id")
         destination = int(storage_id) if storage_id and str(storage_id).lstrip('-').isdigit() else "me"
-        
+
         if storage_id and destination != "me":
             link = acc_info.get("storage_chat_link")
             if link:
                 try: await client.join_chat(link)
                 except: pass
-        
+
         if message.photo:
             await client.send_photo(destination, path, caption=caption + "صورة 📷")
         elif message.video:
@@ -488,7 +662,7 @@ async def save_ttl_media(client, message, acc_info, user):
             await client.send_audio(destination, path, caption=caption + "ملف صوتي 🎵")
         else:
             await client.send_document(destination, path, caption=caption + "ملف غير معروف")
-            
+
         if os.path.exists(path):
             os.remove(path)
     except Exception as e:
@@ -506,10 +680,10 @@ async def run_single_autopost(phone, idx, task):
         tasks = acc.get("autopost", [])
         if idx >= len(tasks): break
         current_task = tasks[idx]
-        if not current_task.get("active"): break 
+        if not current_task.get("active"): break
 
         interval = current_task.get("interval", 60)
-        await asyncio.sleep(interval * 60) 
+        await asyncio.sleep(interval * 60)
 
         acc = DB_STATE["accounts"].get(phone)
         if not acc: break
@@ -528,7 +702,7 @@ async def run_single_autopost(phone, idx, task):
                 await client.send_message(target, msg)
                 await asyncio.sleep(random.randint(5, 15))
             except Exception: await asyncio.sleep(10)
-            
+
         if phone in DB_STATE["accounts"] and idx < len(DB_STATE["accounts"][phone]["autopost"]):
             DB_STATE["accounts"][phone]["autopost"][idx]["last_sent"] = time.time()
             asyncio.create_task(save_to_channel())
@@ -547,24 +721,34 @@ async def start_single_client(phone, info):
             in_memory=True
         )
         client.acc_phone = phone
-        
+
         owner_id = info.get("owner_id", PRIMARY_ADMIN_ID)
-        
+
         client.add_handler(MessageHandler(handle_private_messages, filters.private & filters.incoming), group=1)
-        client.add_handler(MessageHandler(handle_user_shortcuts, filters.user(owner_id) & filters.text), group=2)
-        client.add_handler(MessageHandler(handle_continuous_reply, filters.user(owner_id) & filters.reply & filters.text), group=3)
-        client.add_handler(MessageHandler(handle_flash_command, filters.user(owner_id) & filters.text), group=4)
-        
+        client.add_handler(MessageHandler(handle_mute_filter, filters.group & filters.incoming), group=2)
+        client.add_handler(MessageHandler(handle_user_shortcuts, filters.user(owner_id) & filters.text), group=3)
+        client.add_handler(MessageHandler(handle_continuous_reply, filters.user(owner_id) & filters.text), group=4)
+        client.add_handler(MessageHandler(handle_flash_command, filters.user(owner_id) & filters.text), group=5)
+        client.add_handler(MessageHandler(handle_purge_commands, filters.user(owner_id) & filters.text), group=6)
+        client.add_handler(MessageHandler(handle_moderation_commands, filters.user(owner_id) & filters.text), group=7)
+
         await client.start()
         client.my_id = (await client.get_me()).id
         RUNNING_CLIENTS[phone] = client
         print(f"✅ الحساب {phone} متصل وجاهز.")
 
+        # استعادة قائمة المكتومين
+        if "muted_users" in info and info["muted_users"]:
+            if phone not in ACTIVE_MUTES:
+                ACTIVE_MUTES[phone] = set()
+            for uid in info["muted_users"]:
+                ACTIVE_MUTES[phone].add(int(uid))
+
+        # استعادة الرشقات النشطة
         raid_config = info.get("raid", {})
         active_targets = raid_config.get("active_targets", [])
         packages = raid_config.get("packages", {})
         raid_speed = info.get("raid_speed", 2.5)
-        
         if active_targets and packages:
             if phone not in ACTIVE_RAIDS:
                 ACTIVE_RAIDS[phone] = []
@@ -587,7 +771,7 @@ async def start_single_client(phone, info):
         for idx, task in enumerate(tasks):
             if task.get("active"):
                 asyncio.create_task(run_single_autopost(phone, idx, task))
-                
+
     except (AuthKeyUnregistered, SessionRevoked):
         print(f"⚠️ الجلسة منتهية للحساب {phone}، سيتم حذفه تلقائياً.")
         DB_STATE["accounts"].pop(phone, None)
@@ -610,7 +794,7 @@ async def format_db_cmd(message):
         await bot.reply_to(message, "⏳ جاري مسح القاعدة وتسجيل الخروج...")
         for phone, client in list(RUNNING_CLIENTS.items()):
             try: await client.log_out()
-            except: 
+            except:
                 try: await client.stop()
                 except: pass
         RUNNING_CLIENTS.clear()
@@ -630,13 +814,13 @@ async def start_cmd(message):
     if user_id not in DB_STATE["admins"]: return
 
     owned = sum(1 for acc in DB_STATE["accounts"].values() if acc["owner_id"] == user_id)
-    
+
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account"))
     markup.add(InlineKeyboardButton("📱 حساباتي المرتبطة", callback_data="my_accounts"), InlineKeyboardButton("🔄 تحديث الصفحة", callback_data="refresh_start"))
     if user_id == PRIMARY_ADMIN_ID:
         markup.add(InlineKeyboardButton("👥 إدارة الإدمنية", callback_data="manage_admins"))
-    
+
     msg_text = (
         f"**حياك الله في لوحة التحكم** 🤖\n\n"
         f"> **يمكنك تصفح خدمات البوت من الازرار الموجودة في الاسفل 👇**\n"
@@ -672,13 +856,13 @@ async def callbacks(call):
         user_states[user_id] = {"step": "phone"}
         await bot.send_message(user_id, "📱 أرسل رقم الحساب مع المفتاح الدولي (مثال: `+9665...`):\n(لإلغاء العملية أرسل `الغاء`)", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
-        
+
     elif data == "my_accounts":
         markup = InlineKeyboardMarkup()
         owned = [phone for phone, info in DB_STATE["accounts"].items() if info["owner_id"] == user_id]
         for phone in owned:
             markup.add(InlineKeyboardButton(f"📱 {phone}", callback_data=f"panel_{phone}"))
-        
+
         msg_text = (
             f"**حساباتك المرتبطة** 📱\n\n"
             f"> **اختر الحساب الذي تريد التحكم به من القائمة أدناه 👇**\n"
@@ -701,12 +885,12 @@ async def callbacks(call):
                 await callbacks(call)
                 return
             except Exception: pass
-        
+
         acc_info = DB_STATE["accounts"].get(phone, {})
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
         reply_status = "✅ مفعل" if acc_info.get("auto_reply", {}).get("active") else "❌ معطل"
         storage_status = "✅ مرتبطة" if acc_info.get("storage_chat_id") else "❌ غير مرتبطة"
-        
+
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(f"📥 حفظ الذاتية: {save_status}", callback_data=f"autosave_{phone}"))
         markup.add(InlineKeyboardButton(f"⚡ الاختصارات", callback_data=f"shortcuts_{phone}"), InlineKeyboardButton(f"🔄 مهام النشر", callback_data=f"autopost_{phone}"))
@@ -715,8 +899,9 @@ async def callbacks(call):
         markup.add(InlineKeyboardButton(f"🛠 مجموعة التخزين: {storage_status}", callback_data=f"fixstorage_{phone}"))
         markup.add(InlineKeyboardButton("🛡 الاستثناءات", callback_data=f"exceptions_{phone}"), InlineKeyboardButton("🔗 انضمام لقناة", callback_data=f"join_{phone}"))
         markup.add(InlineKeyboardButton("✍️ تغيير النبذة", callback_data=f"bio_{phone}"))
+        markup.add(InlineKeyboardButton("⚙️ تخصيص الأوامر", callback_data=f"custom_cmds_{phone}"))
         markup.add(InlineKeyboardButton("🗑 حذف وتسجيل خروج", callback_data=f"delete_{phone}"), InlineKeyboardButton("🔙 رجوع", callback_data="my_accounts"))
-        
+
         msg_text = (
             f"**إعدادات الحساب: `{phone}`** ⚙️\n\n"
             f"> **اختر من الخدمات أدناه للتحكم في حسابك بالكامل 👇**\n"
@@ -729,14 +914,14 @@ async def callbacks(call):
         phone = data.split("_")[1]
         packages = DB_STATE["accounts"][phone].get("raid", {}).get("packages", {})
         raid_speed = DB_STATE["accounts"][phone].get("raid_speed", 2.5)
-        
+
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton(f"⚡ السرعة الحالية: {raid_speed} ث", callback_data=f"set_speed_{phone}"))
         markup.add(InlineKeyboardButton("➕ إضافة قائمة رد مستمر جديدة", callback_data=f"addpkg_{phone}"))
-        
+
         msg_text = f"⚔️ **قوائم الرد المستمر - `{phone}`**\n"
         msg_text += f"⏱ **السرعة العامة بين الرسائل:** `{raid_speed}` ثانية\n\n"
-        
+
         for pkg_id, pkg in packages.items():
             mode_str = "فرديات 🔠" if pkg["mode"] == "words" else "جمل 📝"
             msg_text += f"📦 **قائمة {pkg_id}:** ({mode_str})\n"
@@ -745,9 +930,9 @@ async def callbacks(call):
                 InlineKeyboardButton(f"✏️ تعديل {pkg_id}", callback_data=f"editpkg_{phone}_{pkg_id}"),
                 InlineKeyboardButton(f"🗑 حذف {pkg_id}", callback_data=f"delpkg_{phone}_{pkg_id}")
             )
-            
+
         markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
-        
+
         msg_text += (
             f"\n🔹 **كيفية الاستخدام:**\n"
             f"لتشغيل قائمة معينة، رد على الشخص واكتب:\n`{DB_STATE['accounts'][phone]['custom_commands']['raid_start']} 1` (استبدل 1 برقم القائمة)\n\n"
@@ -765,13 +950,12 @@ async def callbacks(call):
     elif data.startswith("addpkg_"):
         phone = data.split("_")[1]
         user_states[user_id] = {"step": "raid_pkg_add_one", "phone": phone, "sentences": []}
-        DB_STATE["accounts"][phone]["temp_sentences"] = []  # مسح أي جمل مؤقتة سابقة
+        DB_STATE["accounts"][phone]["temp_sentences"] = []
         await bot.send_message(user_id, "✍️ **أرسل الجملة الأولى:**\n(لإلغاء العملية أرسل `الغاء`)", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
 
     elif data.startswith("add_sentence_"):
         phone = data.split("_")[2]
-        # العودة لاستقبال جملة جديدة
         user_states[user_id]["step"] = "raid_pkg_add_one"
         await bot.send_message(user_id, "✍️ **أرسل الجملة التالية:**")
         await bot.answer_callback_query(call.id)
@@ -783,14 +967,13 @@ async def callbacks(call):
         if not sentences:
             await bot.answer_callback_query(call.id, "❌ لم تتم إضافة أي جملة!", show_alert=True)
             return
-        
+
         user_states[user_id]["sentences"] = sentences
         user_states[user_id]["step"] = "raid_pkg_mode"
-        # حذف الجمل المؤقتة من قاعدة البيانات
         if "temp_sentences" in DB_STATE["accounts"][phone]:
             del DB_STATE["accounts"][phone]["temp_sentences"]
         await save_to_channel()
-        
+
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("جمل كاملة 📝", callback_data=f"pkgmode_{phone}_sentences"))
         markup.add(InlineKeyboardButton("كلمة كلمة (فرديات) 🔠", callback_data=f"pkgmode_{phone}_words"))
@@ -801,7 +984,6 @@ async def callbacks(call):
         parts = data.split("_")
         phone = parts[1]
         pkg_id = parts[2]
-        # تعديل الجمل بنفس الطريقة القديمة (سطر بسطر)
         user_states[user_id] = {"step": "raid_edit_sentences", "phone": phone, "pkg_id": pkg_id}
         await bot.send_message(user_id, f"✍️ **أرسل الجمل الجديدة للقائمة {pkg_id}:**\n(كل جملة في سطر منفصل)\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
@@ -810,12 +992,12 @@ async def callbacks(call):
         parts = data.split("_")
         phone = parts[1]
         mode = parts[2]
-        
+
         state = user_states.get(user_id, {})
         if state.get("step") == "raid_pkg_mode" and state.get("phone") == phone:
             packages = DB_STATE["accounts"][phone]["raid"]["packages"]
             new_id = str(max([int(k) for k in packages.keys() if k.isdigit()] + [0]) + 1)
-            
+
             packages[new_id] = {
                 "sentences": state["sentences"],
                 "delay": 0,
@@ -823,7 +1005,7 @@ async def callbacks(call):
             }
             await save_to_channel()
             user_states.pop(user_id, None)
-            
+
             await bot.answer_callback_query(call.id, f"✅ تم حفظ القائمة برقم {new_id}!", show_alert=True)
             call.data = f"raid_{phone}"
             await callbacks(call)
@@ -833,7 +1015,7 @@ async def callbacks(call):
         phone = parts[1]
         pkg_id = parts[2]
         mode = parts[3]
-        
+
         state = user_states.get(user_id, {})
         if state.get("step") == "raid_edit_mode" and state.get("phone") == phone and state.get("pkg_id") == pkg_id:
             packages = DB_STATE["accounts"][phone]["raid"]["packages"]
@@ -850,18 +1032,18 @@ async def callbacks(call):
         parts = data.split("_")
         phone = parts[1]
         pkg_id = parts[2]
-        
+
         pkg = DB_STATE["accounts"][phone]["raid"]["packages"].get(pkg_id)
         if not pkg: return
-        
+
         sentences = pkg["sentences"]
         text = f"📝 **محتوى القائمة رقم {pkg_id}:**\n\n"
         for i, s in enumerate(sentences, 1):
             text += f"{i}. {s}\n"
-            
+
         if len(text) > 3800:
             text = text[:3800] + "\n\n... (تم قص الباقي)"
-            
+
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🔙 رجوع للقوائم", callback_data=f"raid_{phone}"))
         await bot.edit_message_text(text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -886,7 +1068,7 @@ async def callbacks(call):
 
         storage_id = DB_STATE["accounts"][phone].get("storage_chat_id")
         storage_link = DB_STATE["accounts"][phone].get("storage_chat_link")
-        
+
         if storage_id:
             try:
                 if storage_link:
@@ -894,7 +1076,7 @@ async def callbacks(call):
                     except: pass
                 else:
                     async for _ in client.get_dialogs(limit=100): pass
-                    
+
                 await client.get_chat(int(storage_id))
                 if not storage_link:
                     try:
@@ -902,10 +1084,10 @@ async def callbacks(call):
                         DB_STATE["accounts"][phone]["storage_chat_link"] = link
                         await save_to_channel()
                     except: pass
-                    
+
                 await bot.answer_callback_query(call.id, "✅ مجموعة التخزين موجودة ومسجلة في القاعدة وتعمل بشكل سليم!", show_alert=True)
                 return
-            except Exception: pass 
+            except Exception: pass
 
         await bot.answer_callback_query(call.id, "⏳ جاري إنشاء المجموعة...")
         storage_id, link = await create_storage_group(client)
@@ -925,7 +1107,7 @@ async def callbacks(call):
         call.data = f"panel_{phone}"
         await callbacks(call)
 
-    # --- إدارة الاستثناءات (قوائم) ---
+    # --- إدارة الاستثناءات ---
     elif data.startswith("exceptions_"):
         phone = data.split("_")[1]
         markup = InlineKeyboardMarkup()
@@ -939,14 +1121,14 @@ async def callbacks(call):
         phone = parts[2]
         exc_type = parts[3]
         exceptions_list = DB_STATE["accounts"][phone]["exceptions"].get(exc_type, [])
-        
+
         markup = InlineKeyboardMarkup()
         for exc in exceptions_list:
             markup.add(InlineKeyboardButton(f"🗑 حذف: {exc}", callback_data=f"delexc_{phone}_{exc_type}_{exc}"))
-            
+
         markup.add(InlineKeyboardButton("➕ إضافة شخص للقائمة", callback_data=f"addexc_{phone}_{exc_type}"))
         markup.add(InlineKeyboardButton("🔙 رجوع", callback_data=f"exceptions_{phone}"))
-        
+
         title = "تحويل رسائل التخزين" if exc_type == "storage" else "الرد التلقائي"
         await bot.edit_message_text(f"🛡 **قائمة المستثنيين من {title}:**\nانقر على الشخص لإزالته من الاستثناء:", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -1019,7 +1201,7 @@ async def callbacks(call):
         phone = data.split("_")[1]
         tasks = DB_STATE["accounts"][phone].get("autopost", [])
         markup = InlineKeyboardMarkup()
-        
+
         for i, task in enumerate(tasks):
             status = "✅" if task.get("active") else "❌"
             targets_count = len(task.get("targets", []))
@@ -1028,10 +1210,10 @@ async def callbacks(call):
                 InlineKeyboardButton(f"⚙️ تعديل القروبات", callback_data=f"edittgts_{phone}_{i}_0"),
                 InlineKeyboardButton(f"🗑 حذف", callback_data=f"delpost_{phone}_{i}")
             )
-            
+
         markup.add(InlineKeyboardButton("➕ إضافة رسالة جديدة للنشر", callback_data=f"newpost_{phone}"))
         markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
-        
+
         await bot.edit_message_text(f"🔄 **إدارة مهام النشر التلقائي - `{phone}`**\nيمكنك تخصيص القروبات لكل رسالة بشكل مستقل:", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("togglepost_"):
@@ -1065,7 +1247,7 @@ async def callbacks(call):
         phone = parts[1]
         idx = int(parts[2])
         page = int(parts[3])
-        
+
         client = RUNNING_CLIENTS.get(phone)
         if not client:
             await bot.answer_callback_query(call.id, "الحساب غير متصل حالياً!", show_alert=True)
@@ -1135,6 +1317,36 @@ async def callbacks(call):
         call.data = f"edittgts_{phone}_{idx}_{page}"
         await callbacks(call)
 
+    # --- تخصيص الأوامر ---
+    elif data.startswith("custom_cmds_"):
+        phone = data.split("_")[2]
+        acc_info = DB_STATE["accounts"][phone]
+        custom_cmds = acc_info.get("custom_commands", {})
+
+        markup = InlineKeyboardMarkup()
+        for key in CUSTOM_COMMAND_KEYS:
+            cur_val = custom_cmds.get(key, DEFAULT_CUSTOM_COMMANDS[key])
+            markup.add(InlineKeyboardButton(f"✏️ {key}: {cur_val}", callback_data=f"editcmd_{phone}_{key}"))
+        markup.add(InlineKeyboardButton("🔙 رجوع للحساب", callback_data=f"panel_{phone}"))
+
+        await bot.edit_message_text(
+            f"⚙️ **تخصيص أوامر الحساب: `{phone}`**\n\n"
+            "اضغط على الأمر لتعديله، أرسل الأمر الجديد بعدها.",
+            chat_id=user_id, message_id=call.message.message_id,
+            reply_markup=markup, parse_mode="Markdown"
+        )
+
+    elif data.startswith("editcmd_"):
+        parts = data.split("_")
+        phone = parts[1]
+        cmd_key = parts[2]
+        if cmd_key not in CUSTOM_COMMAND_KEYS:
+            await bot.answer_callback_query(call.id, "❌ أمر غير معروف!")
+            return
+        user_states[user_id] = {"step": "edit_custom_cmd", "phone": phone, "cmd_key": cmd_key}
+        await bot.send_message(user_id, f"✍️ أرسل الأمر الجديد بدلاً من `{cmd_key}`:")
+        await bot.answer_callback_query(call.id)
+
     # --- بقية الأوامر ---
     elif data.startswith("bio_"):
         phone = data.split("_")[1]
@@ -1147,13 +1359,13 @@ async def callbacks(call):
         user_states[user_id] = {"step": "wait_link", "phone": phone}
         await bot.send_message(user_id, "🔗 أرسل رابط القناة أو الجروب:\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
-        
+
     elif data.startswith("delete_"):
         phone = data.split("_")[1]
         client = RUNNING_CLIENTS.get(phone)
         if client:
             try: await client.log_out()
-            except: 
+            except:
                 try: await client.stop()
                 except: pass
             RUNNING_CLIENTS.pop(phone, None)
@@ -1171,12 +1383,12 @@ async def callbacks(call):
         markup.add(InlineKeyboardButton("➕ إضافة أدمن جديد", callback_data="add_admin"))
         markup.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_main"))
         await bot.edit_message_text("👥 **قائمة الإدمنية الحاليين:**", chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        
+
     elif data == "add_admin" and user_id == PRIMARY_ADMIN_ID:
         user_states[user_id] = {"step": "add_admin_id"}
         await bot.send_message(user_id, "👥 أرسل الآي دي (ID) الخاص بالأدمن الجديد:\nلإلغاء العملية أرسل `الغاء`", parse_mode="Markdown")
         await bot.answer_callback_query(call.id)
-        
+
     elif data.startswith("remove_admin_") and user_id == PRIMARY_ADMIN_ID:
         target = int(data.split("_")[2])
         if target in DB_STATE["admins"]:
@@ -1184,17 +1396,16 @@ async def callbacks(call):
             await save_to_channel()
             call.data = "manage_admins"
             await callbacks(call)
-            
+
     elif data == "back_main":
         await start_cmd(call.message)
 
 @bot.message_handler(content_types=['text', 'photo', 'video', 'voice', 'document', 'audio', 'video_note'])
 async def handle_inputs(message):
     user_id = message.chat.id
-    
+
     if message.text and message.text.strip() == "الغاء":
         if user_id in user_states:
-            # إزالة أي جمل مؤقتة إذا كانت العملية هي إضافة جمل
             if user_states[user_id].get("step") in ["raid_pkg_add_one", "raid_pkg_wait_choice"]:
                 phone = user_states[user_id].get("phone")
                 if phone and "temp_sentences" in DB_STATE["accounts"].get(phone, {}):
@@ -1210,7 +1421,6 @@ async def handle_inputs(message):
     state = user_states[user_id]
     step = state.get("step")
 
-    # --- إضافة سرعة عامة جديدة ---
     if step == "raid_speed":
         phone = state["phone"]
         try:
@@ -1227,26 +1437,22 @@ async def handle_inputs(message):
         except ValueError:
             await bot.reply_to(message, "❌ يرجى إرسال رقم صحيح موجب (مثال: 0.5 أو 1).")
 
-    # --- إضافة جملة واحدة (الطريقة الجديدة) ---
     elif step == "raid_pkg_add_one":
         phone = state["phone"]
         text = message.text
         if not text:
             await bot.reply_to(message, "❌ أرسل نصاً فقط.")
             return
-        
-        # إضافة الجملة إلى القائمة المؤقتة في حالة المستخدم
+
         sentences = state.get("sentences", [])
         sentences.append(text)
         user_states[user_id]["sentences"] = sentences
-        
-        # تحديث قاعدة البيانات المؤقتة
+
         DB_STATE["accounts"][phone]["temp_sentences"] = sentences
         asyncio.create_task(save_to_channel())
-        
-        # الانتظار لاختيار المستخدم
+
         user_states[user_id]["step"] = "raid_pkg_wait_choice"
-        
+
         markup = InlineKeyboardMarkup()
         markup.row(
             InlineKeyboardButton("➕ إضافة جملة أخرى", callback_data=f"add_sentence_{phone}"),
@@ -1254,7 +1460,6 @@ async def handle_inputs(message):
         )
         await bot.reply_to(message, "✅ تمت إضافة الجملة. هل تريد إضافة جملة أخرى؟", reply_markup=markup)
 
-    # --- تعديل جمل القائمة (الطريقة القديمة سطر بسطر) ---
     elif step == "raid_edit_sentences":
         phone = state["phone"]
         pkg_id = state["pkg_id"]
@@ -1262,7 +1467,7 @@ async def handle_inputs(message):
         if not text:
             await bot.reply_to(message, "❌ أرسل نصاً فقط.")
             return
-            
+
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         if not lines: return
         user_states[user_id]["sentences"] = lines
@@ -1272,7 +1477,6 @@ async def handle_inputs(message):
         markup.add(InlineKeyboardButton("كلمة كلمة (فرديات) 🔠", callback_data=f"editpkgmode_{phone}_{pkg_id}_words"))
         await bot.reply_to(message, "⚙️ **اختر الوضع الجديد للقائمة:**", reply_markup=markup, parse_mode="Markdown")
 
-    # --- إضافة الاستثناءات ---
     elif step == "add_exception":
         phone = state["phone"]
         exc_type = state["exc_type"]
@@ -1290,7 +1494,6 @@ async def handle_inputs(message):
             await bot.reply_to(message, f"⚠️ الشخص `{target_str}` موجود بالفعل في القائمة.")
         user_states.pop(user_id, None)
 
-    # --- إضافة الاختصارات ---
     elif step == "shortcut_kw":
         kw = message.text.strip()
         state["keyword"] = kw
@@ -1301,7 +1504,7 @@ async def handle_inputs(message):
         phone = state["phone"]
         kw = state["keyword"]
         client = RUNNING_CLIENTS.get(phone)
-        
+
         if message.content_type == 'text':
             DB_STATE["accounts"][phone]["shortcuts"][kw] = {"type": "text", "text": message.text}
             await save_to_channel()
@@ -1332,7 +1535,7 @@ async def handle_inputs(message):
                     elif message.document: msg_s = await client.send_document(int(storage_chat_id) if str(storage_chat_id).lstrip('-').isdigit() else storage_chat_id, path, caption=caption)
                     elif message.audio: msg_s = await client.send_audio(int(storage_chat_id) if str(storage_chat_id).lstrip('-').isdigit() else storage_chat_id, path, caption=caption)
                     elif message.video_note: msg_s = await client.send_video_note(int(storage_chat_id) if str(storage_chat_id).lstrip('-').isdigit() else storage_chat_id, path)
-                        
+
                     DB_STATE["accounts"][phone]["shortcuts"][kw] = {"type": "media", "msg_id": msg_s.id, "chat_id": storage_chat_id}
                     await save_to_channel()
                     user_states.pop(user_id, None)
@@ -1347,7 +1550,6 @@ async def handle_inputs(message):
             else:
                 await bot.reply_to(message, "❌ نوع الملف غير مدعوم.")
 
-    # --- تسجيل الدخول ---
     elif step == "phone":
         phone = message.text.strip().replace(" ", "")
         client = Client(f"temp_{phone}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
@@ -1370,22 +1572,19 @@ async def handle_inputs(message):
             session = await client.export_session_string()
             storage_chat_id, storage_link = await create_storage_group(client)
             DB_STATE["accounts"][phone] = {
-                "session": session, "owner_id": user_id, "auto_save": False, 
+                "session": session, "owner_id": user_id, "auto_save": False,
                 "autopost": [], "storage_chat_id": storage_chat_id, "storage_chat_link": storage_link,
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
                 "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
                 "raid": {"packages": {}, "active_targets": []},
                 "raid_speed": 2.5,
-                "custom_commands": {
-                    "raid_start": ".ضرب",
-                    "raid_stop": ".ايقاف",
-                    "flash": ".فلش"
-                },
-                "temp_sentences": []
+                "custom_commands": DEFAULT_CUSTOM_COMMANDS.copy(),
+                "temp_sentences": [],
+                "muted_users": []
             }
             await save_to_channel()
             await client.disconnect()
-            await start_single_client(phone, DB_STATE["accounts"][phone])  
+            await start_single_client(phone, DB_STATE["accounts"][phone])
             user_states.pop(user_id, None)
             msg_reply = f"✅ **تم ربط الحساب `{phone}`!**\n"
             msg_reply += "تم إنشاء 'مجموعة التخزين' بنجاح." if storage_chat_id else "⚠️ فشل إنشاء مجموعة التخزين تلقائياً، يرجى إنشائها من الإعدادات."
@@ -1404,18 +1603,15 @@ async def handle_inputs(message):
             session = await client.export_session_string()
             storage_chat_id, storage_link = await create_storage_group(client)
             DB_STATE["accounts"][phone] = {
-                "session": session, "owner_id": user_id, "auto_save": False, 
+                "session": session, "owner_id": user_id, "auto_save": False,
                 "autopost": [], "storage_chat_id": storage_chat_id, "storage_chat_link": storage_link,
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
                 "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
                 "raid": {"packages": {}, "active_targets": []},
                 "raid_speed": 2.5,
-                "custom_commands": {
-                    "raid_start": ".ضرب",
-                    "raid_stop": ".ايقاف",
-                    "flash": ".فلش"
-                },
-                "temp_sentences": []
+                "custom_commands": DEFAULT_CUSTOM_COMMANDS.copy(),
+                "temp_sentences": [],
+                "muted_users": []
             }
             await save_to_channel()
             await client.disconnect()
@@ -1427,7 +1623,6 @@ async def handle_inputs(message):
         except Exception as e:
             await bot.reply_to(message, f"❌ كلمة المرور خطأ: {e}")
 
-    # --- إضافة أدمن جديد ---
     elif step == "add_admin_id":
         try:
             new_admin_id = int(message.text.strip())
@@ -1444,7 +1639,19 @@ async def handle_inputs(message):
         finally:
             user_states.pop(user_id, None)
 
-    # --- إعدادات الرد التلقائي ---
+    elif step == "edit_custom_cmd":
+        phone = state["phone"]
+        cmd_key = state["cmd_key"]
+        new_cmd = message.text.strip()
+        if not new_cmd.startswith("."):
+            new_cmd = "." + new_cmd
+        DB_STATE["accounts"][phone]["custom_commands"][cmd_key] = new_cmd
+        await save_to_channel()
+        user_states.pop(user_id, None)
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 رجوع لتخصيص الأوامر", callback_data=f"custom_cmds_{phone}"))
+        await bot.reply_to(message, f"✅ تم تغيير `{cmd_key}` إلى `{new_cmd}`", reply_markup=markup)
+
     elif step == "autoreply_msg":
         user_states[user_id]["reply_msg"] = message.text
         user_states[user_id]["step"] = "autoreply_cooldown"
@@ -1464,7 +1671,6 @@ async def handle_inputs(message):
         except:
             await bot.reply_to(message, "❌ يرجى إرسال رقم الساعات فقط (مثال: `5`).")
 
-    # --- إعدادات النشر التلقائي ---
     elif step == "post_msg":
         user_states[user_id]["msg"] = message.text
         user_states[user_id]["step"] = "post_interval"
@@ -1495,7 +1701,7 @@ async def start_bot():
     await bot.delete_webhook(drop_pending_updates=True)
     await sync_from_channel()
     await start_active_sessions()
-    asyncio.create_task(autopost_worker()) 
+    asyncio.create_task(autopost_worker())
     print("🚀 Shadow Userbot Agency v3 (optimized) is running on Render!")
     while True:
         try:
