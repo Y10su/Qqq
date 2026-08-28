@@ -60,7 +60,7 @@ async def sync_from_channel():
                                     "cached_groups": [], "shortcuts": {}, 
                                     "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
                                     "raid": {"packages": {}, "active_targets": {}},
-                                    "raid_speed": 2.5   # ← جديدة
+                                    "raid_speed": 2.5
                                 }
                             else:
                                 if "auto_save" not in info: info["auto_save"] = False
@@ -72,7 +72,7 @@ async def sync_from_channel():
                                 if "shortcuts" not in info: info["shortcuts"] = {}
                                 if "exceptions" not in info: info["exceptions"] = {"storage": [], "autoreply": []}
                                 if "last_replies" not in info: info["last_replies"] = {}
-                                if "raid_speed" not in info: info["raid_speed"] = 2.5   # ← جديدة
+                                if "raid_speed" not in info: info["raid_speed"] = 2.5
                                 
                                 if "raid" not in info: 
                                     info["raid"] = {"packages": {}, "active_targets": {}}
@@ -167,7 +167,7 @@ async def download_telebot_media(message):
         new_file.write(downloaded_file)
     return path
 
-# ====== مهمة الرد المستمر الذكية (قوائم متعددة، تأخير عام) ======
+# ====== مهمة الرد المستمر الذكية ======
 async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sentences, mode="sentences", speed=2.5):
     items_to_send = []
     if mode == "words":
@@ -189,7 +189,7 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
                 try:
                     await client.send_message(chat_id, item, reply_to_message_id=target_msg_id)
                     sent = True
-                    await asyncio.sleep(speed)   # ← السرعة العامة
+                    await asyncio.sleep(speed)
                 except FloodWait as e:
                     await asyncio.sleep(e.value + 1)
                 except Exception as e:
@@ -252,7 +252,7 @@ async def handle_continuous_reply(client, message):
         await save_to_channel()
         
         await message.delete() 
-        speed = DB_STATE["accounts"][phone].get("raid_speed", 2.5)   # ← السرعة العامة
+        speed = DB_STATE["accounts"][phone].get("raid_speed", 2.5)
         asyncio.create_task(raid_worker(client, phone, message.chat.id, message.reply_to_message.id, target_id, pkg["sentences"], pkg["mode"], speed))
 
     elif text == ".ايقاف":
@@ -295,7 +295,7 @@ async def handle_user_shortcuts(client, message):
                 await client.copy_message(message.chat.id, chat_id, shortcut["msg_id"])
         except Exception: pass
 
-# ====== معالج الخاص والذاتية (محسّن لحفظ TTL) ======
+# ====== معالج الخاص والذاتية ======
 async def handle_private_messages(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
@@ -319,12 +319,10 @@ async def handle_private_messages(client, message):
     elif user_id_str in exceptions["autoreply"] or (username and username in exceptions["autoreply"]):
         is_reply_exc = True
 
-    # التحقق من كون الرسالة ذاتية التدمير (TTL) بطريقة أكثر موثوقية
     ttl = getattr(message, "ttl_seconds", 0) or getattr(message, "media_ttl_seconds", 0) or getattr(message, "ttl", 0)
     is_ttl = ttl > 0
 
     if is_ttl and acc_info.get("auto_save"):
-        # نبدأ عملية الحفظ في مهمة منفصلة حتى لا نعرقل باقي المعالجة
         asyncio.create_task(save_ttl_media(client, message, acc_info, user))
 
     storage_id = acc_info.get("storage_chat_id")
@@ -353,14 +351,13 @@ async def handle_private_messages(client, message):
                 asyncio.create_task(save_to_channel())  
             except: pass
 
-# وظيفة مساعدة لحفظ وسائط الرسائل ذاتية التدمير
 async def save_ttl_media(client, message, acc_info, user):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
     
     try:
         path = None
-        for attempt in range(3):  # محاولات لتحميل الملف قبل اختفائه
+        for attempt in range(3):
             try:
                 path = await message.download()
                 if path and os.path.exists(path):
@@ -377,18 +374,15 @@ async def save_ttl_media(client, message, acc_info, user):
         sender_id = user.id if user else "غير معروف"
         caption = f"🤫 **تم صيد رسالة ذاتية التدمير!**\nالمرسل: {sender_name} (ID: {sender_id})\nالنوع: "
         
-        # نحدد الوجهة: مجموعة التخزين إن وجدت، وإلا المحادثة الخاصة (self)
         storage_id = acc_info.get("storage_chat_id")
         destination = int(storage_id) if storage_id and str(storage_id).lstrip('-').isdigit() else "me"
         
-        # إذا كانت مجموعة التخزين موجودة، نتأكد من عضويتنا فيها
         if storage_id and destination != "me":
             link = acc_info.get("storage_chat_link")
             if link:
                 try: await client.join_chat(link)
                 except: pass
         
-        # نرسل الوسائط المناسبة
         if message.photo:
             await client.send_photo(destination, path, caption=caption + "صورة 📷")
         elif message.video:
@@ -404,15 +398,12 @@ async def save_ttl_media(client, message, acc_info, user):
         elif message.audio:
             await client.send_audio(destination, path, caption=caption + "ملف صوتي 🎵")
         else:
-            # لو لم يتعرف على النوع، نرسل كملف
             await client.send_document(destination, path, caption=caption + "ملف غير معروف")
             
-        # تنظيف الملف المؤقت
         if os.path.exists(path):
             os.remove(path)
     except Exception as e:
         print(f"❌ فشل حفظ رسالة ذاتية التدمير: {e}")
-        # محاولة تنظيف إن أمكن
         try:
             if 'path' in locals() and path and os.path.exists(path):
                 os.remove(path)
@@ -480,7 +471,7 @@ async def start_single_client(phone, info):
         raid_config = info.get("raid", {})
         active_targets = raid_config.get("active_targets", {})
         packages = raid_config.get("packages", {})
-        raid_speed = info.get("raid_speed", 2.5)   # ← السرعة العامة
+        raid_speed = info.get("raid_speed", 2.5)
         
         if active_targets and packages:
             if phone not in ACTIVE_RAIDS: ACTIVE_RAIDS[phone] = {}
@@ -696,7 +687,7 @@ async def callbacks(call):
             
             packages[new_id] = {
                 "sentences": state["sentences"],
-                "delay": 0,   # لن يستخدم، السرعة العامة هي المعتمدة
+                "delay": 0,
                 "mode": mode
             }
             await save_to_channel()
@@ -1094,13 +1085,12 @@ async def handle_inputs(message):
             user_states.pop(user_id, None)
             await bot.reply_to(message, f"⚡ تم تحديث السرعة العامة إلى `{speed}` ثانية.")
             call_data = f"raid_{phone}"
-            # ننشئ كائن استدعاء وهمي لتحديث الواجهة
             fake_call = type('obj', (object,), {'data': call_data, 'message': message, 'id': '123', 'answer_callback_query': lambda *a, **k: None})()
             await callbacks(fake_call)
         except ValueError:
             await bot.reply_to(message, "❌ يرجى إرسال رقم صحيح موجب (مثال: 0.5 أو 1).")
 
-    # --- إضافة قوائم الرد المستمر (بدون طلب delay) ---
+    # --- إضافة قوائم الرد المستمر ---
     elif step == "raid_pkg_sentences":
         phone = state["phone"]
         text = message.text
@@ -1237,7 +1227,7 @@ async def handle_inputs(message):
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
                 "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
                 "raid": {"packages": {}, "active_targets": {}},
-                "raid_speed": 2.5   # ← جديدة
+                "raid_speed": 2.5
             }
             await save_to_channel()
             await client.disconnect()
@@ -1265,7 +1255,7 @@ async def handle_inputs(message):
                 "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
                 "cached_groups": [], "shortcuts": {}, "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
                 "raid": {"packages": {}, "active_targets": {}},
-                "raid_speed": 2.5   # ← جديدة
+                "raid_speed": 2.5
             }
             await save_to_channel()
             await client.disconnect()
@@ -1276,6 +1266,23 @@ async def handle_inputs(message):
             await bot.reply_to(message, msg_reply, parse_mode="Markdown")
         except Exception as e:
             await bot.reply_to(message, f"❌ كلمة المرور خطأ: {e}")
+
+    # --- إضافة أدمن جديد (الإصلاح هنا) ---
+    elif step == "add_admin_id":
+        try:
+            new_admin_id = int(message.text.strip())
+            if new_admin_id in DB_STATE["admins"]:
+                await bot.reply_to(message, "⚠️ هذا الشخص أدمن بالفعل.")
+            else:
+                DB_STATE["admins"].append(new_admin_id)
+                await save_to_channel()
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 رجوع لإدارة الأدمنية", callback_data="manage_admins"))
+                await bot.reply_to(message, f"✅ تم إضافة الأدمن `{new_admin_id}` بنجاح!", reply_markup=markup, parse_mode="Markdown")
+        except ValueError:
+            await bot.reply_to(message, "❌ يرجى إرسال آي دي رقمي صحيح (مثال: `123456789`).")
+        finally:
+            user_states.pop(user_id, None)
 
     # --- إعدادات الرد التلقائي ---
     elif step == "autoreply_msg":
