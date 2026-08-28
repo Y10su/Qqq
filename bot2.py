@@ -444,7 +444,7 @@ async def handle_purge_commands(client, message):
             except Exception as e:
                 print(f"❌ خطأ في مسح رسائل الشخص: {e}")
 
-# ====== معالج أوامر الإشراف ======
+# ====== معالج أوامر الإشراف (كتم، حظر، تقييد) مع حفظ في القاعدة ======
 async def handle_moderation_commands(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
@@ -476,6 +476,9 @@ async def handle_moderation_commands(client, message):
             return
 
         if text.startswith(mute_cmd):
+            # منع كتم نفسك
+            if target_user.id == getattr(client, "my_id", None):
+                return
             if phone not in ACTIVE_MUTES:
                 ACTIVE_MUTES[phone] = set()
             ACTIVE_MUTES[phone].add(target_user.id)
@@ -520,13 +523,16 @@ async def handle_moderation_commands(client, message):
     except Exception as e:
         print(f"❌ خطأ في أوامر الإشراف: {e}")
 
-# معالج حذف رسائل المكتومين تلقائياً
+# معالج حذف رسائل المكتومين تلقائياً (مع استثناء المالك)
 async def handle_mute_filter(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone: return
     if phone not in ACTIVE_MUTES:
         return
     if not message.from_user:
+        return
+    # لا تحذف رسائل المالك أبداً
+    if message.from_user.id == getattr(client, "my_id", None):
         return
     if message.from_user.id in ACTIVE_MUTES[phone]:
         try:
