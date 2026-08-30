@@ -5,19 +5,23 @@ import re
 import time
 import random
 import tempfile
+import traceback
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client, filters, StopPropagation
 from pyrogram.handlers import MessageHandler
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid, AuthKeyUnregistered, SessionRevoked, FloodWait
+from pyrogram.errors import (
+    SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid,
+    AuthKeyUnregistered, SessionRevoked, FloodWait, MessageIdInvalid,
+    MessageDeleteForbidden, ChatWriteForbidden, SlowmodeWait,
+    MessageNotModified, RPCError, ChatAdminRequired, UserRestricted
+)
 from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.types import ChatPermissions
 
 # ==========================================
 # 1. إعدادات اليوزر بوت
 # ==========================================
-# ⚠️ تم تفريغ البيانات الحساسة لحمايتك. ضع بياناتك الجديدة هنا ⚠️
-
 BOT_TOKEN = "8666142908:AAFZhEu_McY2TEy_6wtGbB7RhjFbxF7fTeE"
 API_ID = 37129514
 API_HASH = "29af008f32ddd784867118d0a58fb8c6"
@@ -28,17 +32,20 @@ bot = AsyncTeleBot(BOT_TOKEN)
 user_states = {}
 RUNNING_CLIENTS = {}
 LAST_REPLY_TIME = {}
-ACTIVE_RAIDS = {}
-ACTIVE_MUTES = {}
+ACTIVE_RAIDS = {}          # تتبع أهداف الرشق النشطة (مع task_key)
+RAID_TASKS = {}            # المهام الفعلية (asyncio.Task) لإمكانية الإلغاء
+ACTIVE_MUTES = {}          # قوائم الكتم النشطة
+DB_LOCK = asyncio.Lock()   # قفل عمليات الحفظ
 
 # ==========================================
-# 2. نظام قاعدة البيانات السحابية الحية
+# 2. نظام قاعدة البيانات السحابية (ملف JSON حقيقي)
 # ==========================================
 DB_STATE = {
     "admins": [PRIMARY_ADMIN_ID],
     "accounts": {}
 }
-DB_MESSAGE_ID = None
+DB_MESSAGE_ID = None  # سيحمل message_id للرسالة المثبتة (التي تحتوي الملف)
+DB_FILE_NAME = "database.json"
 
 CUSTOM_COMMAND_KEYS = ["raid_start", "raid_stop", "flash", "purge", "purge_me", "mute", "unmute", "ban", "restrict"]
 
@@ -54,123 +61,163 @@ DEFAULT_CUSTOM_COMMANDS = {
     "restrict": ".تقييد"
 }
 
+def cleanup_task(task_key):
+    """إزالة المهمة من RAID_TASKS تلقائياً بعد انتهائها."""
+    RAID_TASKS.pop(task_key, None)
+
+async def save_to_channel(create_new=False):
+    """حفظ قاعدة البيانات كملف JSON مرفوع إلى القناة المثبتة."""
+    global DB_MESSAGE_ID
+    async with DB_LOCK:
+        if PRIMARY_ADMIN_ID not in DB_STATE["admins"]:
+            DB_STATE["admins"].append(PRIMARY_ADMIN_ID)
+
+        # منع حفظ cached_groups لتقليل حجم القاعدة
+        for acc in DB_STATE["accounts"].values():
+            acc["cached_groups"] = []
+
+        # 1. إنشاء ملف مؤقت
+        tmp_path = os.path.join(tempfile.gettempdir(), f"db_{int(time.time())}_{random.randint(1000,9999)}.json")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(DB_STATE, f, indent=2, ensure_ascii=False)
+
+        try:
+            # 2. رفع الملف كـ document إلى القناة
+            with open(tmp_path, "rb") as f:
+                msg = await bot.send_document(
+                    chat_id=DB_CHANNEL_ID,
+                    document=f,
+                    caption="📦 قاعدة بيانات اليوزر بوت (ملف JSON)"
+                )
+
+            # 3. حذف الرسالة القديمة المثبتة إذا وجدت (بعد نجاح الرفع)
+            if DB_MESSAGE_ID and not create_new:
+                try:
+                    await bot.delete_message(DB_CHANNEL_ID, DB_MESSAGE_ID)
+                except Exception as e:
+                    print(f"⚠️ فشل حذف الرسالة القديمة: {e}")
+                    DB_MESSAGE_ID = None  # الملف القديم غير موجود
+
+            # 4. تثبيت الرسالة الجديدة وحفظ معرفها
+            DB_MESSAGE_ID = msg.message_id
+            await bot.pin_chat_message(DB_CHANNEL_ID, DB_MESSAGE_ID)
+
+        except Exception as e:
+            print(f"❌ فشل حفظ قاعدة البيانات: {traceback.format_exc()}")
+        finally:
+            # تنظيف الملف المؤقت
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
 async def sync_from_channel():
+    """قراءة قاعدة البيانات من الرسالة المثبتة (document) وتحميلها."""
     global DB_STATE, DB_MESSAGE_ID
     try:
         chat = await bot.get_chat(DB_CHANNEL_ID)
         if chat.pinned_message:
             DB_MESSAGE_ID = chat.pinned_message.message_id
-            text = chat.pinned_message.text or chat.pinned_message.caption
-            if text:
-                match = re.search(r'(\{.*\})', text, re.DOTALL)
-                if match:
-                    try:
-                        data = json.loads(match.group(1))
-                        DB_STATE["admins"] = list(set(data.get("admins", []) + [PRIMARY_ADMIN_ID]))
+            if chat.pinned_message.document:
+                # تنزيل الملف
+                file_info = await bot.get_file(chat.pinned_message.document.file_id)
+                downloaded = await bot.download_file(file_info.file_path)
+                tmp_path = os.path.join(tempfile.gettempdir(), f"db_download_{int(time.time())}.json")
+                with open(tmp_path, "wb") as f:
+                    f.write(downloaded)
 
-                        accounts = data.get("accounts", {})
-                        for phone, info in accounts.items():
-                            if isinstance(info, str):
-                                accounts[phone] = {
-                                    "session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False,
-                                    "autopost": [], "storage_chat_id": None, "storage_chat_link": None,
-                                    "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
-                                    "cached_groups": [], "shortcuts": {},
-                                    "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
-                                    "raid": {"packages": {}, "active_targets": []},
-                                    "raid_speed": 2.5,
-                                    "custom_commands": DEFAULT_CUSTOM_COMMANDS.copy(),
-                                    "temp_sentences": [],
-                                    "muted_users": []
-                                }
+                with open(tmp_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                os.remove(tmp_path)
+
+                # تحديث DB_STATE
+                DB_STATE["admins"] = list(set(data.get("admins", []) + [PRIMARY_ADMIN_ID]))
+                accounts = data.get("accounts", {})
+                # تطبيع البيانات
+                for phone, info in accounts.items():
+                    if isinstance(info, str):
+                        accounts[phone] = {
+                            "session": info, "owner_id": PRIMARY_ADMIN_ID, "auto_save": False,
+                            "autopost": [], "storage_chat_id": None, "storage_chat_link": None,
+                            "auto_reply": {"active": False, "msg": "", "cooldown_hours": 3},
+                            "cached_groups": [], "shortcuts": {},
+                            "exceptions": {"storage": [], "autoreply": []}, "last_replies": {},
+                            "raid": {"packages": {}, "active_targets": []},
+                            "raid_speed": 2.5,
+                            "custom_commands": DEFAULT_CUSTOM_COMMANDS.copy(),
+                            "temp_sentences": [],
+                            "muted_users": []
+                        }
+                    else:
+                        if "auto_save" not in info: info["auto_save"] = False
+                        if "autopost" not in info or isinstance(info["autopost"], dict): info["autopost"] = []
+                        if "storage_chat_id" not in info: info["storage_chat_id"] = None
+                        if "storage_chat_link" not in info: info["storage_chat_link"] = None
+                        if "auto_reply" not in info: info["auto_reply"] = {"active": False, "msg": "", "cooldown_hours": 3}
+                        if "cached_groups" not in info: info["cached_groups"] = []
+                        if "shortcuts" not in info: info["shortcuts"] = {}
+                        if "exceptions" not in info: info["exceptions"] = {"storage": [], "autoreply": []}
+                        if "last_replies" not in info: info["last_replies"] = {}
+                        if "raid_speed" not in info: info["raid_speed"] = 2.5
+                        if "temp_sentences" not in info: info["temp_sentences"] = []
+                        if "muted_users" not in info: info["muted_users"] = []
+
+                        if "custom_commands" not in info:
+                            info["custom_commands"] = DEFAULT_CUSTOM_COMMANDS.copy()
+                        else:
+                            for key in CUSTOM_COMMAND_KEYS:
+                                if key not in info["custom_commands"]:
+                                    info["custom_commands"][key] = DEFAULT_CUSTOM_COMMANDS[key]
+
+                        if "raid" not in info:
+                            info["raid"] = {"packages": {}, "active_targets": []}
+                        else:
+                            if "packages" not in info["raid"]:
+                                info["raid"]["packages"] = {}
+                                if "sentences" in info["raid"]:
+                                    if info["raid"]["sentences"]:
+                                        info["raid"]["packages"]["1"] = {
+                                            "sentences": info["raid"]["sentences"],
+                                            "mode": info["raid"].get("mode", "sentences"),
+                                            "delay": 2.5
+                                        }
+                                    del info["raid"]["sentences"]
+                                    if "mode" in info["raid"]: del info["raid"]["mode"]
+                            if "active_targets" in info["raid"]:
+                                if isinstance(info["raid"]["active_targets"], dict):
+                                    new_targets = []
+                                    for tgt_id_str, tgt_data in info["raid"]["active_targets"].items():
+                                        tgt_data["target_id"] = int(tgt_id_str)
+                                        new_targets.append(tgt_data)
+                                    info["raid"]["active_targets"] = new_targets
                             else:
-                                if "auto_save" not in info: info["auto_save"] = False
-                                if "autopost" not in info or isinstance(info["autopost"], dict): info["autopost"] = []
-                                if "storage_chat_id" not in info: info["storage_chat_id"] = None
-                                if "storage_chat_link" not in info: info["storage_chat_link"] = None
-                                if "auto_reply" not in info: info["auto_reply"] = {"active": False, "msg": "", "cooldown_hours": 3}
-                                if "cached_groups" not in info: info["cached_groups"] = []
-                                if "shortcuts" not in info: info["shortcuts"] = {}
-                                if "exceptions" not in info: info["exceptions"] = {"storage": [], "autoreply": []}
-                                if "last_replies" not in info: info["last_replies"] = {}
-                                if "raid_speed" not in info: info["raid_speed"] = 2.5
-                                if "temp_sentences" not in info: info["temp_sentences"] = []
-                                if "muted_users" not in info: info["muted_users"] = []
+                                info["raid"]["active_targets"] = []
+                        # إزالة مفتاح "key" إذا وجد قديمًا
+                        for tgt in info["raid"].get("active_targets", []):
+                            tgt.pop("key", None)
 
-                                if "custom_commands" not in info:
-                                    info["custom_commands"] = DEFAULT_CUSTOM_COMMANDS.copy()
-                                else:
-                                    for key in CUSTOM_COMMAND_KEYS:
-                                        if key not in info["custom_commands"]:
-                                            info["custom_commands"][key] = DEFAULT_CUSTOM_COMMANDS[key]
-
-                                if "raid" not in info:
-                                    info["raid"] = {"packages": {}, "active_targets": []}
-                                else:
-                                    if "packages" not in info["raid"]:
-                                        info["raid"]["packages"] = {}
-                                        if "sentences" in info["raid"]:
-                                            if info["raid"]["sentences"]:
-                                                info["raid"]["packages"]["1"] = {
-                                                    "sentences": info["raid"]["sentences"],
-                                                    "mode": info["raid"].get("mode", "sentences"),
-                                                    "delay": 2.5
-                                                }
-                                            del info["raid"]["sentences"]
-                                            if "mode" in info["raid"]: del info["raid"]["mode"]
-                                    if "active_targets" in info["raid"]:
-                                        if isinstance(info["raid"]["active_targets"], dict):
-                                            new_targets = []
-                                            for tgt_id_str, tgt_data in info["raid"]["active_targets"].items():
-                                                tgt_data["target_id"] = int(tgt_id_str)
-                                                new_targets.append(tgt_data)
-                                            info["raid"]["active_targets"] = new_targets
-                                    else:
-                                        info["raid"]["active_targets"] = []
-
-                        DB_STATE["accounts"] = accounts
-                        print(f"✅ تم استرجاع {len(DB_STATE['accounts'])} حساب محفوظ.")
-                        return
-                    except Exception as e:
-                        print(f"❌ فشل فك التشفير: {e}")
-        await save_to_channel()
-    except Exception as e:
-        print(f"❌ خطأ قراءة القناة: {e}")
-        await save_to_channel(create_new=True)
-
-async def save_to_channel(create_new=False):
-    global DB_MESSAGE_ID
-    if PRIMARY_ADMIN_ID not in DB_STATE["admins"]:
-        DB_STATE["admins"].append(PRIMARY_ADMIN_ID)
-    payload = json.dumps(DB_STATE, indent=2, ensure_ascii=False)
-    formatted_text = f"📦 **قاعدة بيانات اليوزر بوت**\n\n```json\n{payload}\n```"
-    try:
-        if DB_MESSAGE_ID and not create_new:
-            try:
-                await bot.edit_message_text(formatted_text, chat_id=DB_CHANNEL_ID, message_id=DB_MESSAGE_ID, parse_mode="Markdown")
-            except Exception as edit_err:
-                if "message to edit not found" in str(edit_err).lower():
-                    msg = await bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
-                    DB_MESSAGE_ID = msg.message_id
-                    await bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
+                DB_STATE["accounts"] = accounts
+                print(f"✅ تم تحميل {len(DB_STATE['accounts'])} حساب من القناة.")
+                return
+            else:
+                print("⚠️ الرسالة المثبتة ليست ملف JSON، سيتم إنشاء قاعدة جديدة.")
+                await save_to_channel(create_new=True)
         else:
-            msg = await bot.send_message(DB_CHANNEL_ID, formatted_text, parse_mode="Markdown")
-            DB_MESSAGE_ID = msg.message_id
-            await bot.pin_chat_message(DB_CHANNEL_ID, msg.message_id)
-    except Exception:
-        pass
+            print("⚠️ لا توجد رسالة مثبتة، سيتم إنشاء قاعدة جديدة.")
+            await save_to_channel(create_new=True)
+    except Exception as e:
+        print(f"❌ خطأ في قراءة القناة: {traceback.format_exc()}")
+        await save_to_channel(create_new=True)
 
 # ==========================================
 # 3. أنظمة اليوزر بوت الآلية المستمرة
 # ==========================================
-
 async def fetch_account_groups(client):
     groups = []
     try:
         async for d in client.get_dialogs(limit=0):
             if d.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
                 groups.append({"id": d.chat.id, "title": d.chat.title})
-    except: pass
+    except Exception as e:
+        print(f"❌ خطأ في fetch_account_groups: {e}")
     return groups
 
 async def create_storage_group(client):
@@ -178,12 +225,15 @@ async def create_storage_group(client):
         chat = await client.create_supergroup("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص وحفظ الميديا هنا تلقائياً")
         link = chat.invite_link or await chat.export_invite_link()
         return chat.id, link
-    except:
+    except Exception as e:
+        print(f"⚠️ فشل إنشاء سوبرقروب: {e}")
         try:
             chat = await client.create_channel("مجموعة التخزين 📁", "يتم تحويل رسائل الخاص وحفظ الميديا هنا تلقائياً")
             link = chat.invite_link or await chat.export_invite_link()
             return chat.id, link
-        except: return None, None
+        except Exception as e2:
+            print(f"❌ فشل إنشاء قناة أيضاً: {e2}")
+            return None, None
 
 async def download_telebot_media(message):
     file_id = None
@@ -196,15 +246,19 @@ async def download_telebot_media(message):
     elif message.video_note: file_id = message.video_note.file_id; ext = ".mp4"
 
     if not file_id: return None
-    file_info = await bot.get_file(file_id)
-    downloaded_file = await bot.download_file(file_info.file_path)
-    tmp_dir = tempfile.gettempdir()
-    path = os.path.join(tmp_dir, f"temp_media_{int(time.time())}_{random.randint(1000,9999)}{ext}")
-    with open(path, 'wb') as new_file:
-        new_file.write(downloaded_file)
-    return path
+    try:
+        file_info = await bot.get_file(file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+        tmp_dir = tempfile.gettempdir()
+        path = os.path.join(tmp_dir, f"temp_media_{int(time.time())}_{random.randint(1000,9999)}{ext}")
+        with open(path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+        return path
+    except Exception as e:
+        print(f"❌ فشل تحميل ميديا من البوت: {e}")
+        return None
 
-# ====== مهمة الرد المستمر الذكية (لا تتوقف أبداً) ======
+# ====== مهمة الرد المستمر الذكية (معدلة مع task_key) ======
 async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sentences, mode="sentences", speed=2.5, task_key=None):
     items_to_send = []
     if mode == "words":
@@ -217,63 +271,75 @@ async def raid_worker(client, phone, chat_id, target_msg_id, target_user_id, sen
         return
 
     while True:
-        # فحص ما إذا كان الرشق لا يزال نشطاً في الذاكرة
-        if phone not in ACTIVE_RAIDS:
-            break
-        task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS[phone])
+        # فحص ما إذا كانت المهمة لا تزال نشطة باستخدام task_key
+        task_exists = any(
+            t.get("task_key") == task_key
+            for t in ACTIVE_RAIDS.get(phone, [])
+        )
         if not task_exists:
             break
 
         for item in items_to_send:
             if not task_exists:
                 break
-            
+
             sent = False
-            while not sent: # حلقة لا نهائية للإرسال حتى تنجح
-                # فحص سريع لعدم التعليق في حلقة لا نهائية لو تم إيقافه
-                task_exists = any(t.get("key") == task_key for t in ACTIVE_RAIDS.get(phone, []))
+            while not sent:
+                task_exists = any(
+                    t.get("task_key") == task_key
+                    for t in ACTIVE_RAIDS.get(phone, [])
+                )
                 if not task_exists:
                     break
-                    
+
                 try:
-                    # إذا كان الـ target_msg_id سارياً، نرد عليه. وإلا نرسل مباشر.
                     if target_msg_id:
                         await client.send_message(chat_id, item, reply_to_message_id=target_msg_id)
                     else:
                         await client.send_message(chat_id, item)
                     sent = True
                     await asyncio.sleep(speed)
-                    
-                except FloodWait as e:
-                    # حظر تليجرام المؤقت
-                    await asyncio.sleep(e.value + 1)
-                except Exception as e:
-                    # اكتشاف وتجاوز جميع المشاكل بصمت
-                    if hasattr(e, 'value') and isinstance(getattr(e, 'value'), int):
-                        # لأي استثناء يمتلك وقت (مثل SlowmodeWait)
-                        await asyncio.sleep(e.value + 1)
-                    else:
-                        err_str = str(e).upper()
-                        # إذا حذف الضحية رسالته، نلغي الربط بها (target_msg_id = None) ونكمل بدونه
-                        if "MESSAGE" in err_str or "REPLY" in err_str or "DELETED" in err_str or "INVALID" in err_str:
-                            target_msg_id = None
-                            # لن يتم تفعيل sent = True، وسيعاد المحاولة فوراً بدون ريبلاي
-                        elif "FORBIDDEN" in err_str or "RESTRICTED" in err_str or "BANNED" in err_str or "SLOWMODE" in err_str:
-                            # كتم مؤقت للحساب، ننام 10 ثوانٍ ونجرب
-                            await asyncio.sleep(10)
-                        else:
-                            # مشكلة غريبة، نتجاوز الكلمة وننام ثانية
-                            sent = True
-                            await asyncio.sleep(1)
 
-# ====== معالج الرد المستمر (يعمل بصمت ويرسل للبوت) ======
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except SlowmodeWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except (MessageIdInvalid, MessageDeleteForbidden, ChatWriteForbidden, UserRestricted, RPCError) as e:
+                    err_str = str(e).upper()
+                    if "MESSAGE" in err_str or "REPLY" in err_str or "DELETED" in err_str or "INVALID" in err_str:
+                        # الرسالة الأصلية حُذفت، نلغي الرد عليها
+                        target_msg_id = None
+                        # تحديث ACTIVE_RAIDS و DB_STATE
+                        for t in ACTIVE_RAIDS.get(phone, []):
+                            if t.get("task_key") == task_key:
+                                t["target_msg_id"] = None
+                                break
+                        # تحديث قاعدة البيانات
+                        acc_raids = DB_STATE["accounts"][phone]["raid"]["active_targets"]
+                        for t in acc_raids:
+                            if t.get("task_key") == task_key:
+                                t["target_msg_id"] = None
+                                break
+                        await save_to_channel()
+                        # لا نجعل sent = True، سيعيد المحاولة فورًا بدون reply
+                    elif "FORBIDDEN" in err_str or "RESTRICTED" in err_str or "BANNED" in err_str:
+                        await asyncio.sleep(10)
+                    else:
+                        sent = True
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"⚠️ خطأ غير متوقع في raid_worker: {traceback.format_exc()}")
+                    sent = True
+                    await asyncio.sleep(1)
+
+# ====== معالج الرد المستمر (مع تحديث task_key و RAID_TASKS) ======
 async def handle_continuous_reply(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
 
     acc_info = DB_STATE["accounts"].get(phone, {})
     owner_id = acc_info.get("owner_id", PRIMARY_ADMIN_ID)
-    
+
     commands = acc_info.get("custom_commands", {})
     raid_start_cmd = commands.get("raid_start", ".ضرب")
     raid_stop_cmd = commands.get("raid_stop", ".ايقاف")
@@ -309,8 +375,8 @@ async def handle_continuous_reply(client, message):
                         target_user = msg.from_user
                         target_msg_id = msg.id
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ خطأ في البحث عن آخر رسالة: {e}")
 
         if not target_user:
             try: await message.delete()
@@ -321,33 +387,40 @@ async def handle_continuous_reply(client, message):
         speed = acc_info.get("raid_speed", 2.5)
 
         task_key = f"{phone}_{target_id}_{int(time.time())}_{random.randint(1000,9999)}"
+
+        # إضافة إلى ACTIVE_RAIDS مع task_key
         if phone not in ACTIVE_RAIDS:
             ACTIVE_RAIDS[phone] = []
-
         ACTIVE_RAIDS[phone].append({
-            "key": task_key,
+            "task_key": task_key,
             "target_id": target_id,
             "chat_id": message.chat.id,
             "target_msg_id": target_msg_id,
             "pkg_id": pkg_id
         })
 
+        # تحديث قاعدة البيانات
         DB_STATE["accounts"][phone]["raid"]["active_targets"].append({
+            "task_key": task_key,
             "target_id": target_id,
             "chat_id": message.chat.id,
             "target_msg_id": target_msg_id,
-            "pkg_id": pkg_id,
-            "key": task_key
+            "pkg_id": pkg_id
         })
         await save_to_channel()
 
         try: await message.delete()
         except: pass
-        
+
         try: await bot.send_message(owner_id, f"⚔️ تم تشغيل الرد المستمر على `{target_user.first_name}` بنجاح.")
         except: pass
 
-        asyncio.create_task(raid_worker(client, phone, message.chat.id, target_msg_id, target_id, pkg["sentences"], pkg["mode"], speed, task_key))
+        # إنشاء المهمة الفعلية وتسجيلها في RAID_TASKS مع تنظيف تلقائي
+        task = asyncio.create_task(
+            raid_worker(client, phone, message.chat.id, target_msg_id, target_id, pkg["sentences"], pkg["mode"], speed, task_key)
+        )
+        task.add_done_callback(lambda t: cleanup_task(task_key))
+        RAID_TASKS[task_key] = task
 
     elif text == raid_stop_cmd:
         try: await message.delete()
@@ -355,18 +428,32 @@ async def handle_continuous_reply(client, message):
 
         if message.reply_to_message and message.reply_to_message.from_user:
             target_id = message.reply_to_message.from_user.id
+            # إيقاف جميع المهام الخاصة بهذا الهدف (قد يكون عدة رشقات)
+            tasks_to_cancel = []
+            for t in ACTIVE_RAIDS.get(phone, []):
+                if t.get("target_id") == target_id:
+                    tasks_to_cancel.append(t.get("task_key"))
+            for tkey in tasks_to_cancel:
+                if tkey in RAID_TASKS:
+                    RAID_TASKS[tkey].cancel()
+                    # سيتم حذف المهمة تلقائياً بواسطة callback
+                # إزالة من ACTIVE_RAIDS
             if phone in ACTIVE_RAIDS:
-                tasks_to_remove = [t for t in ACTIVE_RAIDS[phone] if t["target_id"] == target_id]
-                for t in tasks_to_remove:
-                    ACTIVE_RAIDS[phone].remove(t)
-                DB_STATE["accounts"][phone]["raid"]["active_targets"] = [
-                    a for a in DB_STATE["accounts"][phone]["raid"]["active_targets"]
-                    if a["target_id"] != target_id
-                ]
-                await save_to_channel()
+                ACTIVE_RAIDS[phone] = [t for t in ACTIVE_RAIDS[phone] if t.get("target_id") != target_id]
+            # تحديث قاعدة البيانات
+            DB_STATE["accounts"][phone]["raid"]["active_targets"] = [
+                a for a in DB_STATE["accounts"][phone]["raid"]["active_targets"]
+                if a["target_id"] != target_id
+            ]
+            await save_to_channel()
             try: await bot.send_message(owner_id, f"🛑 تم إيقاف الرد المستمر عن `{message.reply_to_message.from_user.first_name}`.")
             except: pass
         else:
+            # إيقاف جميع المهام لهذا الحساب
+            for tkey, task in list(RAID_TASKS.items()):
+                if tkey.startswith(f"{phone}_"):
+                    task.cancel()
+                    # سيتم التنظيف بواسطة callback
             if phone in ACTIVE_RAIDS:
                 ACTIVE_RAIDS[phone].clear()
             DB_STATE["accounts"][phone]["raid"]["active_targets"] = []
@@ -414,37 +501,38 @@ async def handle_flash_command(client, message):
                 await asyncio.sleep(0.5)
             except FloodWait as e:
                 await asyncio.sleep(e.value + 1)
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ خطأ في حظر عضو أثناء الفلش: {e}")
                 continue
 
         try: await bot.send_message(owner_id, f"✅ تم تفليش القروب {chat_title} بنجاح!\nتم حظر {count} عضو.")
         except: pass
 
     except Exception as e:
-        pass
+        print(f"❌ خطأ في الفلش: {e}")
 
 # ====== معالج أوامر الحذف (صامت) ======
 async def handle_purge_commands(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text:
         return
-        
+
     acc_info = DB_STATE["accounts"].get(phone, {})
     owner_id = acc_info.get("owner_id", PRIMARY_ADMIN_ID)
     custom_cmds = acc_info.get("custom_commands", {})
     purge_cmd = custom_cmds.get("purge", ".مسح")
     purge_me_cmd = custom_cmds.get("purge_me", ".مسح رسائلي")
-    
+
     text = message.text.strip()
     chat_id = message.chat.id
     chat_title = message.chat.title or "المحادثة"
-    
+
     if not (text == purge_me_cmd or text.startswith(purge_cmd + " ") or text == purge_cmd):
         return
-        
+
     try: await message.delete()
     except: pass
-        
+
     if text == purge_me_cmd:
         try:
             msg_ids = []
@@ -457,11 +545,14 @@ async def handle_purge_commands(client, message):
                         await asyncio.sleep(0.5)
                     except FloodWait as e:
                         await asyncio.sleep(e.value + 1)
+                    except Exception as e:
+                        print(f"⚠️ خطأ في حذف رسائلي: {e}")
             try: await bot.send_message(owner_id, f"✅ تم مسح رسائلك الأخيرة في {chat_title} بنجاح.")
             except: pass
-        except Exception: pass
+        except Exception as e:
+            print(f"❌ خطأ في مسح رسائلي: {e}")
         return
-        
+
     if text.startswith(purge_cmd + " "):
         parts = text.split()
         if len(parts) >= 2:
@@ -481,11 +572,14 @@ async def handle_purge_commands(client, message):
                             await asyncio.sleep(0.5)
                         except FloodWait as e:
                             await asyncio.sleep(e.value + 1)
+                        except Exception as e:
+                            print(f"⚠️ خطأ في حذف الرسائل: {e}")
                 try: await bot.send_message(owner_id, f"✅ تم مسح أحدث {count} رسالة في {chat_title}.")
                 except: pass
-            except Exception: pass
+            except Exception as e:
+                print(f"❌ خطأ في مسح عدد: {e}")
             return
-            
+
     if text == purge_cmd and message.reply_to_message:
         try:
             start_id = message.reply_to_message.id
@@ -498,12 +592,15 @@ async def handle_purge_commands(client, message):
                         await asyncio.sleep(0.5)
                     except FloodWait as e:
                         await asyncio.sleep(e.value + 1)
+                    except Exception as e:
+                        print(f"⚠️ خطأ في مسح بين رسالتين: {e}")
             try: await bot.send_message(owner_id, f"✅ تم المسح بنجاح في {chat_title}.")
             except: pass
-        except Exception: pass
+        except Exception as e:
+            print(f"❌ خطأ في المسح بالرد: {e}")
         return
 
-# ====== معالج أوامر الإشراف (كتم، حظر، تقييد) - (عالمي وصامت تماماً) ======
+# ====== معالج أوامر الإشراف ======
 async def handle_moderation_commands(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
@@ -529,7 +626,7 @@ async def handle_moderation_commands(client, message):
         except: pass
         return
 
-    try: await message.delete() 
+    try: await message.delete()
     except: pass
 
     # 1. نظام الكتم العالمي
@@ -558,7 +655,7 @@ async def handle_moderation_commands(client, message):
             except: pass
             return
 
-    # 2. الحظر والتقييد (تتطلب صلاحيات إشراف فعلية في القروب)
+    # 2. الحظر والتقييد
     try:
         me = await client.get_chat_member(chat_id, "me")
         if not me.privileges:
@@ -594,8 +691,8 @@ async def handle_moderation_commands(client, message):
                 try: await bot.send_message(owner_id, f"❌ ما عندك صلاحية التقييد في {chat_title}.")
                 except: pass
             return
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"❌ خطأ في الإشراف: {e}")
 
 # معالج حذف رسائل المكتومين تلقائياً
 async def handle_mute_filter(client, message):
@@ -608,10 +705,11 @@ async def handle_mute_filter(client, message):
 
     if message.from_user.id in ACTIVE_MUTES[phone]:
         try: await message.delete()
-        except Exception: pass
+        except Exception as e:
+            print(f"⚠️ خطأ في حذف رسالة مكتوم: {e}")
         raise StopPropagation
 
-# ====== الاختصارات ======
+# ====== الاختصارات (مع حماية ضد الاختصار المعطوب) ======
 async def handle_user_shortcuts(client, message):
     phone = getattr(client, "acc_phone", None)
     if not phone or not message.text: return
@@ -632,8 +730,18 @@ async def handle_user_shortcuts(client, message):
                 if storage_link:
                     try: await client.join_chat(storage_link)
                     except: pass
-                await client.copy_message(message.chat.id, chat_id, shortcut["msg_id"])
-        except Exception: pass
+                try:
+                    await client.copy_message(message.chat.id, chat_id, shortcut["msg_id"])
+                except (MessageIdInvalid, RPCError) as e:
+                    # الوسائط لم تعد موجودة، نحذف الاختصار
+                    print(f"⚠️ اختصار معطوب: {text} -> {e}")
+                    del DB_STATE["accounts"][phone]["shortcuts"][text]
+                    await save_to_channel()
+                    owner_id = DB_STATE["accounts"].get(phone, {}).get("owner_id", PRIMARY_ADMIN_ID)
+                    try: await bot.send_message(owner_id, f"❌ تم حذف الاختصار `{text}` لأن الميديا لم تعد موجودة.")
+                    except: pass
+        except Exception as e:
+            print(f"❌ خطأ في تنفيذ الاختصار: {e}")
 
 # ====== معالج الخاص والذاتية ======
 async def handle_private_messages(client, message):
@@ -668,13 +776,15 @@ async def handle_private_messages(client, message):
     if storage_id and not is_ttl and not is_storage_exc:
         try:
             await message.forward(int(storage_id))
-        except:
+        except Exception as e:
+            print(f"⚠️ فشل تحويل رسالة للتخزين: {e}")
             link = acc_info.get("storage_chat_link")
             if link:
                 try:
                     await client.join_chat(link)
                     await message.forward(int(storage_id))
-                except: pass
+                except Exception as e2:
+                    print(f"❌ فشل إعادة المحاولة للتخزين: {e2}")
 
     auto_reply = acc_info.get("auto_reply", {})
     if auto_reply.get("active") and auto_reply.get("msg") and not is_reply_exc and not is_ttl:
@@ -687,8 +797,9 @@ async def handle_private_messages(client, message):
             try:
                 await client.send_message(user.id, auto_reply["msg"])
                 DB_STATE["accounts"][phone]["last_replies"][user_id_str] = current_time
-                asyncio.create_task(save_to_channel())
-            except: pass
+                await save_to_channel()
+            except Exception as e:
+                print(f"❌ فشل إرسال الرد التلقائي: {e}")
 
 async def save_ttl_media(client, message, acc_info, user):
     phone = getattr(client, "acc_phone", None)
@@ -703,7 +814,8 @@ async def save_ttl_media(client, message, acc_info, user):
                     break
                 else:
                     await asyncio.sleep(0.5)
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ محاولة تنزيل فاشلة: {e}")
                 await asyncio.sleep(0.5)
 
         if not path:
@@ -742,7 +854,7 @@ async def save_ttl_media(client, message, acc_info, user):
         if os.path.exists(path):
             os.remove(path)
     except Exception as e:
-        print(f"❌ فشل حفظ رسالة ذاتية التدمير: {e}")
+        print(f"❌ فشل حفظ رسالة ذاتية التدمير: {traceback.format_exc()}")
         try:
             if 'path' in locals() and path and os.path.exists(path):
                 os.remove(path)
@@ -777,16 +889,19 @@ async def run_single_autopost(phone, idx, task):
             try:
                 await client.send_message(target, msg)
                 await asyncio.sleep(random.randint(5, 15))
-            except Exception: await asyncio.sleep(10)
+            except Exception as e:
+                print(f"⚠️ خطأ في النشر التلقائي: {e}")
+                await asyncio.sleep(10)
 
         if phone in DB_STATE["accounts"] and idx < len(DB_STATE["accounts"][phone]["autopost"]):
             DB_STATE["accounts"][phone]["autopost"][idx]["last_sent"] = time.time()
-            asyncio.create_task(save_to_channel())
+            await save_to_channel()
 
 async def autopost_worker():
     while True:
         await asyncio.sleep(300)
 
+# ====== تشغيل حساب واحد ======
 async def start_single_client(phone, info):
     try:
         session = info.get("session")
@@ -797,7 +912,7 @@ async def start_single_client(phone, info):
             in_memory=True
         )
         client.acc_phone = phone
-        client.owner_id = info.get("owner_id", PRIMARY_ADMIN_ID)  
+        client.owner_id = info.get("owner_id", PRIMARY_ADMIN_ID)
 
         owner_id = info.get("owner_id", PRIMARY_ADMIN_ID)
         cmd_filter = filters.text & (filters.me | filters.user(owner_id))
@@ -814,12 +929,14 @@ async def start_single_client(phone, info):
         RUNNING_CLIENTS[phone] = client
         print(f"✅ الحساب {phone} متصل وجاهز.")
 
+        # استعادة المكتومين
         if "muted_users" in info and info["muted_users"]:
             if phone not in ACTIVE_MUTES:
                 ACTIVE_MUTES[phone] = set()
             for uid in info["muted_users"]:
                 ACTIVE_MUTES[phone].add(int(uid))
 
+        # استعادة الرشق النشط من قاعدة البيانات
         raid_config = info.get("raid", {})
         active_targets = raid_config.get("active_targets", [])
         packages = raid_config.get("packages", {})
@@ -831,17 +948,30 @@ async def start_single_client(phone, info):
                 target_id = tgt_data.get("target_id")
                 pkg_id = tgt_data.get("pkg_id", "1")
                 if pkg_id in packages:
-                    task_key = tgt_data.get("key", f"{phone}_{target_id}_{int(time.time())}")
+                    # توليد task_key جديد
+                    task_key = f"{phone}_{target_id}_{int(time.time())}_{random.randint(1000,9999)}"
+                    # إضافة إلى ACTIVE_RAIDS مع task_key
                     ACTIVE_RAIDS[phone].append({
-                        "key": task_key,
+                        "task_key": task_key,
                         "target_id": target_id,
                         "chat_id": tgt_data.get("chat_id"),
                         "target_msg_id": tgt_data.get("target_msg_id"),
                         "pkg_id": pkg_id
                     })
+                    # تحديث قاعدة البيانات مع task_key
+                    for t in DB_STATE["accounts"][phone]["raid"]["active_targets"]:
+                        if t.get("target_id") == target_id and t.get("pkg_id") == pkg_id and not t.get("task_key"):
+                            t["task_key"] = task_key
+                            break
+                    await save_to_channel()  # حفظ task_key في القاعدة
                     pkg = packages[pkg_id]
-                    asyncio.create_task(raid_worker(client, phone, tgt_data.get("chat_id"), tgt_data.get("target_msg_id"), target_id, pkg["sentences"], pkg["mode"], raid_speed, task_key))
+                    task = asyncio.create_task(
+                        raid_worker(client, phone, tgt_data.get("chat_id"), tgt_data.get("target_msg_id"), target_id, pkg["sentences"], pkg["mode"], raid_speed, task_key)
+                    )
+                    task.add_done_callback(lambda t, key=task_key: cleanup_task(key))
+                    RAID_TASKS[task_key] = task
 
+        # استعادة مهام النشر التلقائي
         tasks = info.get("autopost", [])
         for idx, task in enumerate(tasks):
             if task.get("active"):
@@ -852,7 +982,7 @@ async def start_single_client(phone, info):
         DB_STATE["accounts"].pop(phone, None)
         await save_to_channel()
     except Exception as e:
-        print(f"❌ فشل تشغيل {phone}: {e}")
+        print(f"❌ فشل تشغيل {phone}: {traceback.format_exc()}")
 
 async def start_active_sessions():
     for phone, info in list(DB_STATE["accounts"].items()):
@@ -873,12 +1003,19 @@ async def format_db_cmd(message):
                 try: await client.stop()
                 except: pass
         RUNNING_CLIENTS.clear()
+        # إيقاف جميع مهام الرشق والنشر
+        for task in RAID_TASKS.values():
+            task.cancel()
+        RAID_TASKS.clear()
+        ACTIVE_RAIDS.clear()
+        ACTIVE_MUTES.clear()
         DB_STATE = {"admins": [PRIMARY_ADMIN_ID], "accounts": {}}
         try:
             chat = await bot.get_chat(DB_CHANNEL_ID)
             if chat.pinned_message:
                 await bot.delete_message(DB_CHANNEL_ID, chat.pinned_message.message_id)
-        except: pass
+        except Exception as e:
+            print(f"⚠️ فشل حذف الرسالة المثبتة: {e}")
         DB_MESSAGE_ID = None
         await save_to_channel(create_new=True)
         await bot.reply_to(message, "🗑 تمت فرمتة القاعدة وتسجيل الخروج من جميع الحسابات.")
@@ -924,7 +1061,8 @@ async def callbacks(call):
             markup.add(InlineKeyboardButton("👥 إدارة الإدمنية", callback_data="manage_admins"))
         try:
             await bot.edit_message_text(msg_text, chat_id=user_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-        except: pass
+        except Exception as e:
+            print(f"⚠️ فشل تحديث الصفحة: {e}")
         await bot.answer_callback_query(call.id, "✅ تم التحديث")
 
     elif data == "add_account":
@@ -959,7 +1097,8 @@ async def callbacks(call):
                 call.data = "my_accounts"
                 await callbacks(call)
                 return
-            except Exception: pass
+            except Exception as e:
+                print(f"⚠️ خطأ في التحقق من الحساب: {e}")
 
         acc_info = DB_STATE["accounts"].get(phone, {})
         save_status = "✅ مفعل" if acc_info.get("auto_save") else "❌ معطل"
@@ -1155,11 +1294,13 @@ async def callbacks(call):
                         link = (await client.get_chat(int(storage_id))).invite_link or await (await client.get_chat(int(storage_id))).export_invite_link()
                         DB_STATE["accounts"][phone]["storage_chat_link"] = link
                         await save_to_channel()
-                    except: pass
+                    except Exception as e:
+                        print(f"⚠️ فشل تحديث رابط التخزين: {e}")
 
                 await bot.answer_callback_query(call.id, "✅ مجموعة التخزين موجودة ومسجلة في القاعدة وتعمل بشكل سليم!", show_alert=True)
                 return
-            except Exception: pass 
+            except Exception as e:
+                print(f"⚠️ فشل التحقق من مجموعة التخزين: {e}")
 
         await bot.answer_callback_query(call.id, "⏳ جاري إنشاء المجموعة...")
         storage_id, link = await create_storage_group(client)
@@ -1324,7 +1465,8 @@ async def callbacks(call):
         if not acc.get("cached_groups"):
             await bot.answer_callback_query(call.id, "⏳ جاري استخراج القروبات، انتظر ثواني...")
             acc["cached_groups"] = await fetch_account_groups(client)
-            await save_to_channel()
+            # لا نحفظ cached_groups في القاعدة، فقط في الذاكرة
+            # await save_to_channel()  # أُزيلت لمنع الحفظ الكبير
 
         groups = acc["cached_groups"]
         task = acc["autopost"][idx]
@@ -1380,7 +1522,7 @@ async def callbacks(call):
         client = RUNNING_CLIENTS.get(phone)
         await bot.answer_callback_query(call.id, "⏳ جاري التحديث من سيرفرات تليجرام...")
         DB_STATE["accounts"][phone]["cached_groups"] = await fetch_account_groups(client)
-        await save_to_channel()
+        # لا نحفظ cached_groups
         call.data = f"edittgts_{phone}_{idx}_{page}"
         await callbacks(call)
 
@@ -1422,6 +1564,15 @@ async def callbacks(call):
                 try: await client.stop()
                 except: pass
             RUNNING_CLIENTS.pop(phone, None)
+        # إيقاف مهام الرشق المرتبطة
+        for key in list(RAID_TASKS.keys()):
+            if key.startswith(f"{phone}_"):
+                RAID_TASKS[key].cancel()
+                # سيتم التنظيف بواسطة callback
+        if phone in ACTIVE_RAIDS:
+            del ACTIVE_RAIDS[phone]
+        if phone in ACTIVE_MUTES:
+            del ACTIVE_MUTES[phone]
         DB_STATE["accounts"].pop(phone, None)
         await save_to_channel()
         await bot.answer_callback_query(call.id, "✅ تم الحذف وتسجيل الخروج بنجاح.", show_alert=True)
@@ -1462,7 +1613,7 @@ async def handle_inputs(message):
                 phone = user_states[user_id].get("phone")
                 if phone and "temp_sentences" in DB_STATE["accounts"].get(phone, {}):
                     del DB_STATE["accounts"][phone]["temp_sentences"]
-                    asyncio.create_task(save_to_channel())
+                    await save_to_channel()
             user_states.pop(user_id, None)
             await bot.reply_to(message, "🚫 **تم إلغاء العملية بنجاح.**", parse_mode="Markdown")
         return
@@ -1483,6 +1634,7 @@ async def handle_inputs(message):
             await save_to_channel()
             user_states.pop(user_id, None)
             await bot.reply_to(message, f"⚡ تم تحديث السرعة العامة إلى `{speed}` ثانية.")
+            # نعرض لوحة الرشق مرة أخرى
             call_data = f"raid_{phone}"
             fake_call = type('obj', (object,), {'data': call_data, 'message': message, 'id': '123', 'answer_callback_query': lambda *a, **k: None})()
             await callbacks(fake_call)
@@ -1501,7 +1653,7 @@ async def handle_inputs(message):
         user_states[user_id]["sentences"] = sentences
 
         DB_STATE["accounts"][phone]["temp_sentences"] = sentences
-        asyncio.create_task(save_to_channel())
+        await save_to_channel()
 
         user_states[user_id]["step"] = "raid_pkg_wait_choice"
 
@@ -1595,6 +1747,7 @@ async def handle_inputs(message):
                     markup.add(InlineKeyboardButton("🔙 رجوع للاختصارات", callback_data=f"shortcuts_{phone}"))
                     await bot.reply_to(message, f"✅ تم حفظ اختصار الميديا للكلمة: `{kw}`", reply_markup=markup, parse_mode="Markdown")
                 except Exception as e:
+                    print(f"❌ خطأ في حفظ اختصار الميديا: {e}")
                     await bot.reply_to(message, f"❌ خطأ في الرفع (تأكد من إعداد مجموعة التخزين أولاً): {e}")
                 finally:
                     if os.path.exists(path):
@@ -1754,7 +1907,7 @@ async def start_bot():
     await sync_from_channel()
     await start_active_sessions()
     asyncio.create_task(autopost_worker())
-    print("🚀 Shadow Userbot Agency v3 (optimized) is running on Render!")
+    print("🚀 Shadow Userbot Agency v5 (Stable + DB_LOCK + task_key) is running!")
     while True:
         try:
             await bot.polling(non_stop=True, timeout=60)
