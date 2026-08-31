@@ -3,3 +3,4 @@ aiohttp
 Flask
 pyrogram
 tgcrypto
+requests
