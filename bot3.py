@@ -1,3 +1,4 @@
+import os
 import json
 import time
 import telebot
@@ -141,13 +142,11 @@ def post_quiz_to_channel(data):
         time.sleep(3)
 
 if __name__ == '__main__':
-    import os
-    
     # تشغيل سيرفر الويب في مسار (Thread) منفصل
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
     print("🤖 البوت يعمل الآن ويستمع للرسائل...")
-    # تشغيل البوت
-    bot.infinity_polling()
+    # تم إضافة skip_pending=True لمسح أي رسائل قديمة وتجنب خطأ 409
+    bot.infinity_polling(skip_pending=True)
